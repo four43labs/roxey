@@ -60,7 +60,16 @@ API key there.
 
 ## Installing the CLI
 
-Download a prebuilt binary from the [releases page](https://github.com/four43labs/roxey/releases)
+No install, via npx (macOS/Linux) — `npm/bin/roxey.js` downloads the
+matching binary from the GitHub Release on first run and caches it in
+`~/.roxey/bin`:
+
+```
+npx roxey auth <api-key-from-dashboard>
+npx roxey start myapp localhost:3000
+```
+
+Or download a prebuilt binary from the [releases page](https://github.com/four43labs/roxey/releases)
 (published by `.github/workflows/release.yml` on `v*.*.*` tags — linux/darwin,
 amd64/arm64), or build from source:
 
@@ -83,8 +92,10 @@ relay over plain `ws://`.
 ## Cutting a release
 
 Tag `vX.Y.Z` and push it — this triggers both workflows: the relay image
-is built and pushed to `ghcr.io/four43labs/roxey-relay:X.Y.Z`, and the CLI
-release workflow builds/publishes the CLI binaries to a GitHub Release.
+is built and pushed to `ghcr.io/four43labs/roxey-relay:X.Y.Z` (and
+`:latest`), and the CLI release workflow cross-builds the CLI, publishes it
+to a GitHub Release, then publishes `npm/` to the npm registry as `roxey@X.Y.Z`
+(needs an `NPM_TOKEN` repo secret with publish access).
 
 ```
 git tag v0.1.0

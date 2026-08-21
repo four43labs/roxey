@@ -1,0 +1,24 @@
+{
+  "name": "roxey",
+  "version": "0.1.0",
+  "description": "CLI for Roxey — ngrok-style tunnels to *.roxey.run",
+  "bin": {
+    "roxey": "bin/roxey.js"
+  },
+  "files": [
+    "bin"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/four43labs/roxey.git"
+  },
+  "homepage": "https://github.com/four43labs/roxey",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ]
+}

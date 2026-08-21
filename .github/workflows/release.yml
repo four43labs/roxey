@@ -51,3 +51,27 @@ jobs:
         with:
           files: dist/*.tar.gz
           generate_release_notes: true
+
+  npm-publish:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      # npm/bin/roxey.js fetches the matching binary from this same
+      # release's assets by tag, so the npm package doesn't bundle
+      # anything platform-specific — its version just needs to match.
+      - name: Set package version from tag
+        working-directory: npm
+        run: npm pkg set version="${GITHUB_REF_NAME#v}"
+
+      - name: Publish
+        working-directory: npm
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

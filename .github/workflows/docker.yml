@@ -4,9 +4,6 @@ on:
   push:
     branches: [main]
     tags: ["v*.*.*"]
-    paths:
-      - "backend/**"
-      - ".github/workflows/docker.yml"
   workflow_dispatch:
 
 permissions:
@@ -32,9 +29,12 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository_owner }}/roxey-relay
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
             type=sha,format=short
             type=semver,pattern={{version}}
+          # latest=auto tags "latest" on both a default-branch push and the
+          # highest semver tag pushed — covers "main" builds and releases.
+          flavor: |
+            latest=auto
 
       - uses: docker/build-push-action@v6
         with:
