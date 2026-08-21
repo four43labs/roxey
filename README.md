@@ -32,16 +32,37 @@ Point `*.roxey.run` (or your domain) at the relay's host through Cloudflare
 (wildcard SSL, proxied). The relay itself speaks plain HTTP — Cloudflare
 terminates TLS in front of it.
 
+Build and run directly:
+
 ```
 cd backend
 cp .env.example .env   # set ROXEY_DOMAIN, ROXEY_ADMIN_USER/PASS
-go run . -race=false   # or: go build -o roxey-relay . && ./roxey-relay
+go build -o roxey-relay . && ./roxey-relay
 ```
+
+Or via the prebuilt image, published to GHCR on every push to `main`
+(`.github/workflows/docker.yml`) and on version tags:
+
+```
+docker run -d -p 8080:8080 \
+  -e ROXEY_DOMAIN=roxey.run \
+  -e ROXEY_ADMIN_USER=admin -e ROXEY_ADMIN_PASS=change-me \
+  -v roxey-data:/data \
+  ghcr.io/four43labs/roxey-relay:latest
+```
+
+The image writes its SQLite file to `/data/roxey.db` (`ROXEY_DB_PATH`,
+already set in the image) — mount `/data` as a volume so API keys and
+tunnel history survive container restarts.
 
 Visit `https://relay.<domain>/` for the dashboard (Basic Auth), generate an
 API key there.
 
 ## Installing the CLI
+
+Download a prebuilt binary from the [releases page](https://github.com/four43labs/roxey/releases)
+(published by `.github/workflows/release.yml` on `v*.*.*` tags — linux/darwin,
+amd64/arm64), or build from source:
 
 ```
 cd cli
@@ -58,3 +79,14 @@ roxey stop myapp
 Set `ROXEY_DOMAIN` / `ROXEY_RELAY_HOST` at `auth` time to point at a
 self-hosted relay; `ROXEY_INSECURE=1` on `start` skips TLS for testing a
 relay over plain `ws://`.
+
+## Cutting a release
+
+Tag `vX.Y.Z` and push it — this triggers both workflows: the relay image
+is built and pushed to `ghcr.io/four43labs/roxey-relay:X.Y.Z`, and the CLI
+release workflow builds/publishes the CLI binaries to a GitHub Release.
+
+```
+git tag v0.1.0
+git push origin v0.1.0
+```
