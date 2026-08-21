@@ -1,0 +1,9 @@
+# Build output
+/backend/roxey-relay
+/cli/roxey
+
+# Runtime state
+backend/roxey.db
+backend/.env
+
+.DS_Store
