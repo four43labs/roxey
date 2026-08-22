@@ -1,31 +1,37 @@
-// Package relay holds the live routing table (service/path -> connected CLI)
-// and the request/response bridge sent over each tunnel's websocket.
+// Package relay holds the live routing table (service/path -> connected CLI).
+// Each tunnel is a multiplexed session (yamux) over the CLI's websocket;
+// every public connection gets its own raw byte stream to the local target.
 package relay
 
 import (
-	"encoding/base64"
-	"encoding/json"
 	"errors"
+	"net"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/gorilla/websocket"
+	"github.com/hashicorp/yamux"
 )
 
 type Entry struct {
-	Conn        *websocket.Conn
 	ConnectedAt time.Time
 	Remote      string
 
-	writeMu sync.Mutex
-	mu      sync.Mutex
-	pending map[string]func(Response)
+	session *yamux.Session
 }
 
-func newEntry(conn *websocket.Conn, remote string) *Entry {
-	return &Entry{Conn: conn, ConnectedAt: time.Now(), Remote: remote, pending: make(map[string]func(Response))}
+func newEntry(sess *yamux.Session, remote string) *Entry {
+	return &Entry{ConnectedAt: time.Now(), Remote: remote, session: sess}
+}
+
+// OpenStream dials a fresh raw TCP stream through the tunnel to the CLI's
+// local target. The caller speaks whatever protocol it wants on the bytes.
+func (e *Entry) OpenStream() (net.Conn, error) {
+	if e.session.IsClosed() {
+		return nil, errors.New("tunnel closed")
+	}
+	return e.session.Open()
 }
 
 type prefixEntry struct {
@@ -45,7 +51,7 @@ type Registry struct {
 
 func NewRegistry() *Registry { return &Registry{table: make(map[string]*serviceTable)} }
 
-func (r *Registry) Register(service, pathPrefix string, conn *websocket.Conn, remote string) (*Entry, error) {
+func (r *Registry) Register(service, pathPrefix string, sess *yamux.Session, remote string) (*Entry, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -55,7 +61,7 @@ func (r *Registry) Register(service, pathPrefix string, conn *websocket.Conn, re
 		r.table[service] = t
 	}
 
-	entry := newEntry(conn, remote)
+	entry := newEntry(sess, remote)
 	if pathPrefix == "" {
 		if t.root != nil {
 			return nil, errors.New("service already in use")
@@ -137,78 +143,4 @@ func (r *Registry) ListActive() []ActiveTunnel {
 		}
 	}
 	return out
-}
-
-// Wire protocol exchanged with the CLI over the tunnel websocket.
-// Bodies are base64'd JSON frames — fine for typical dev traffic; large
-// file/streaming payloads would need a binary framing upgrade.
-type Request struct {
-	Type    string              `json:"type"`
-	ID      string              `json:"id"`
-	Method  string              `json:"method"`
-	Path    string              `json:"path"`
-	Headers map[string][]string `json:"headers"`
-	BodyB64 string              `json:"bodyB64,omitempty"`
-}
-
-type Response struct {
-	Type    string              `json:"type"`
-	ID      string              `json:"id"`
-	Status  int                 `json:"status"`
-	Headers map[string][]string `json:"headers"`
-	BodyB64 string              `json:"bodyB64,omitempty"`
-}
-
-// SendRequest forwards an HTTP request over the tunnel and blocks for the matching response.
-func (e *Entry) SendRequest(id, method, path string, headers map[string][]string, body []byte, timeout time.Duration) (Response, error) {
-	ch := make(chan Response, 1)
-	e.mu.Lock()
-	e.pending[id] = func(resp Response) { ch <- resp }
-	e.mu.Unlock()
-
-	req := Request{Type: "request", ID: id, Method: method, Path: path, Headers: headers}
-	if len(body) > 0 {
-		req.BodyB64 = base64.StdEncoding.EncodeToString(body)
-	}
-	data, err := json.Marshal(req)
-	if err != nil {
-		return Response{}, err
-	}
-
-	e.writeMu.Lock()
-	err = e.Conn.WriteMessage(websocket.TextMessage, data)
-	e.writeMu.Unlock()
-	if err != nil {
-		e.mu.Lock()
-		delete(e.pending, id)
-		e.mu.Unlock()
-		return Response{}, err
-	}
-
-	select {
-	case resp := <-ch:
-		return resp, nil
-	case <-time.After(timeout):
-		e.mu.Lock()
-		delete(e.pending, id)
-		e.mu.Unlock()
-		return Response{}, errors.New("tunnel timeout")
-	}
-}
-
-// HandleMessage dispatches a response frame read from the tunnel to its waiting SendRequest call.
-func (e *Entry) HandleMessage(raw []byte) {
-	var resp Response
-	if err := json.Unmarshal(raw, &resp); err != nil || resp.Type != "response" {
-		return
-	}
-	e.mu.Lock()
-	cb, ok := e.pending[resp.ID]
-	if ok {
-		delete(e.pending, resp.ID)
-	}
-	e.mu.Unlock()
-	if ok {
-		cb(resp)
-	}
 }

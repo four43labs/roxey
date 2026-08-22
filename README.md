@@ -3,9 +3,10 @@
 ngrok-style tunnel for exposing local dev ports (or ports on a VPS) at
 `https://<service>.<your-domain>`. Two independent Go modules:
 
-- `backend/` — the relay: terminates `*.<domain>`, proxies HTTP requests to
-  the connected CLI over a websocket, and serves a Basic-Auth REST API +
-  dashboard on the admin host for API keys and live tunnels.
+- `backend/` — the relay: terminates `*.<domain>`, pipes each connection as a
+  raw TCP stream to the connected CLI over a multiplexed websocket, and serves
+  a Basic-Auth REST API + dashboard on the admin host for API keys and live
+  tunnels.
 - `cli/` — the `roxey` binary users install locally or on a VPS.
 
 ## How it connects
@@ -15,16 +16,16 @@ ngrok-style tunnel for exposing local dev ports (or ports on a VPS) at
    (`wss://relay.<domain>/_ws`), authenticated with a bearer API key.
 2. The relay registers that connection under `<service>` (and, for
    `service/path/*` specs, under a path prefix within that service).
-3. A public request to `https://<service>.<domain>/...` is buffered and
-   sent as a JSON frame over the matching websocket; the CLI worker replays
-   it against the local target and ships the response back the same way.
+3. A public request to `https://<service>.<domain>/...` is streamed over a
+   fresh raw TCP stream (yamux-multiplexed inside the CLI's websocket); the
+   CLI dials the local target's port and pipes bytes both ways until either
+   side closes.
 4. `roxey stop` kills the local worker process; the relay notices the
    socket close and deregisters automatically.
 
-Request/response bodies are base64'd JSON frames — fine for normal dev
-traffic, not built for large file streaming or passing through the tunneled
-app's own websocket connections (e.g. Vite/webpack HMR). Both would need a
-binary framing upgrade.
+Because each connection is a raw byte pipe, anything on top of HTTP passes
+through untouched: websocket upgrades (Vite/webpack HMR), SSE/chunked
+responses, and large uploads/downloads all stream without buffering.
 
 ## Deploying the relay
 

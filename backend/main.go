@@ -1,21 +1,23 @@
 // Command roxey-relay is the public relay: it terminates HTTP for *.{domain}
-// tunnel subdomains and proxies each request to the connected CLI over
-// websocket, and serves a Basic-Auth-protected REST API + dashboard on
-// the admin host for managing API keys and viewing live tunnels.
+// tunnel subdomains and pipes each connection as a raw TCP stream (multiplexed
+// with yamux over the CLI's websocket) to the connected CLI's local target,
+// and serves a Basic-Auth-protected REST API + dashboard on the admin host
+// for managing API keys and viewing live tunnels.
 package main
 
 import (
-	"encoding/base64"
+	"context"
 	"encoding/json"
-	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/http/httputil"
 	"os"
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"github.com/hashicorp/yamux"
 
 	"roxey-relay/internal/auth"
 	"roxey-relay/internal/relay"
@@ -172,7 +174,15 @@ func handleWSUpgrade(upgrader websocket.Upgrader, reg *relay.Registry, st *store
 		return
 	}
 
-	entry, err := reg.Register(service, pathPrefix, conn, r.RemoteAddr)
+	// Wrap the websocket as a stream multiplexer: every public connection is
+	// a raw byte stream inside this one session.
+	sess, err := yamux.Server(relay.NewWSNetConn(conn), nil)
+	if err != nil {
+		conn.Close()
+		return
+	}
+
+	entry, err := reg.Register(service, pathPrefix, sess, r.RemoteAddr)
 	if err != nil {
 		_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(4000, err.Error()), time.Now().Add(time.Second))
 		conn.Close()
@@ -184,6 +194,7 @@ func handleWSUpgrade(upgrader websocket.Upgrader, reg *relay.Registry, st *store
 	}
 	defer func() {
 		reg.Unregister(service, pathPrefix, entry)
+		sess.Close()
 		conn.Close()
 		if eventID != "" {
 			if err := st.RecordDisconnect(eventID); err != nil {
@@ -192,12 +203,15 @@ func handleWSUpgrade(upgrader websocket.Upgrader, reg *relay.Registry, st *store
 		}
 	}()
 
+	// Block until the CLI's session (or the websocket) drops. Streams are
+	// opened on demand by handleTunnelRequest; anything the CLI opens back
+	// is closed immediately.
 	for {
-		_, raw, err := conn.ReadMessage()
+		stream, err := sess.Accept()
 		if err != nil {
 			return
 		}
-		entry.HandleMessage(raw)
+		stream.Close()
 	}
 }
 
@@ -208,33 +222,25 @@ func handleTunnelRequest(reg *relay.Registry, service string, w http.ResponseWri
 		return
 	}
 
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
-		return
+	// Each public connection gets a fresh raw stream through the tunnel;
+	// the CLI pipes it straight to the local target's TCP port, so any
+	// protocol on top of HTTP (websockets, SSE, chunked uploads...) passes
+	// through untouched.
+	proxy := &httputil.ReverseProxy{
+		Director: func(req *http.Request) {
+			req.URL.Scheme = "http"
+			req.URL.Host = "tunneled"
+		},
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return entry.OpenStream()
+			},
+			ResponseHeaderTimeout: 30 * time.Second,
+		},
+		FlushInterval: -1,
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			http.Error(w, "tunnel error: "+err.Error(), http.StatusBadGateway)
+		},
 	}
-
-	path := r.URL.Path
-	if r.URL.RawQuery != "" {
-		path += "?" + r.URL.RawQuery
-	}
-
-	resp, err := entry.SendRequest(uuid.NewString(), r.Method, path, map[string][]string(r.Header), body, 30*time.Second)
-	if err != nil {
-		http.Error(w, "tunnel error: "+err.Error(), http.StatusGatewayTimeout)
-		return
-	}
-
-	for k, vals := range resp.Headers {
-		for _, v := range vals {
-			w.Header().Add(k, v)
-		}
-	}
-	w.WriteHeader(resp.Status)
-	if resp.BodyB64 != "" {
-		data, err := base64.StdEncoding.DecodeString(resp.BodyB64)
-		if err == nil {
-			_, _ = w.Write(data)
-		}
-	}
+	proxy.ServeHTTP(w, r)
 }
