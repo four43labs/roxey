@@ -65,8 +65,8 @@ matching binary from the GitHub Release on first run and caches it in
 `~/.roxey/bin`:
 
 ```
-npx roxey auth <api-key-from-dashboard>
-npx roxey start myapp localhost:3000
+npx @abhikrishnaram/roxey auth <api-key-from-dashboard>
+npx @abhikrishnaram/roxey start myapp localhost:3000
 ```
 
 Or download a prebuilt binary from the [releases page](https://github.com/four43labs/roxey/releases)
@@ -94,7 +94,8 @@ relay over plain `ws://`.
 Tag `vX.Y.Z` and push it — this triggers both workflows: the relay image
 is built and pushed to `ghcr.io/four43labs/roxey-relay:X.Y.Z` (and
 `:latest`), and the CLI release workflow cross-builds the CLI, publishes it
-to a GitHub Release, then publishes `npm/` to the npm registry as `roxey@X.Y.Z`
+to a GitHub Release, then publishes `npm/` to the npm registry as
+`@abhikrishnaram/roxey@X.Y.Z`
 (needs an `NPM_TOKEN` repo secret with publish access).
 
 ```
