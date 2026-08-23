@@ -4,6 +4,7 @@
 package tunnel
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -49,15 +50,28 @@ func parseTarget(target string) (host, port string) {
 	return "localhost", target
 }
 
-// Run connects to the relay and blocks, bridging tunneled streams to the
-// local target, until the connection drops or the process is signaled.
-func Run(service, pathPrefix, target string) error {
-	cfg, err := config.Load()
-	if err != nil {
-		return err
+// handshakeReason extracts the relay's rejection message (e.g. "service
+// already in use", sent as an HTTP error body or a close frame) so failures
+// aren't just a generic "bad handshake".
+func handshakeReason(resp *http.Response) string {
+	if resp == nil || resp.Body == nil {
+		return ""
 	}
-	if cfg == nil {
-		return fmt.Errorf("not authenticated, run `roxey auth` first")
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 512))
+	if err != nil || len(body) == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" (%s)", strings.TrimSpace(string(body)))
+}
+
+// Run connects to the relay for tld (at relay.<tld>) and blocks, bridging
+// tunneled streams to the local target, until the connection drops or the
+// process is signaled.
+func Run(tld, service, pathPrefix, target string) error {
+	sc, ok := config.ServerFor(tld)
+	if !ok || sc.APIKey == "" {
+		return fmt.Errorf("no API key saved for %s, run `roxey auth --tld %s <key>` first", tld, tld)
 	}
 
 	host, port := parseTarget(target)
@@ -66,18 +80,29 @@ func Run(service, pathPrefix, target string) error {
 	if os.Getenv("ROXEY_INSECURE") == "1" { // for testing against a relay without TLS
 		scheme = "ws"
 	}
-	u := url.URL{Scheme: scheme, Host: cfg.RelayHost, Path: "/_ws"}
+	relayHost := os.Getenv("ROXEY_RELAY_HOST") // overrides the relay.<tld> hostname (self-hosted/testing)
+	if relayHost == "" {
+		relayHost = "relay." + tld
+	}
+	u := url.URL{Scheme: scheme, Host: relayHost, Path: "/_ws"}
 	q := u.Query()
 	q.Set("service", service)
 	q.Set("path", pathPrefix)
 	u.RawQuery = q.Encode()
 
 	hdr := http.Header{}
-	hdr.Set("Authorization", "Bearer "+cfg.APIKey)
+	hdr.Set("Authorization", "Bearer "+sc.APIKey)
 
-	conn, _, err := websocket.DefaultDialer.Dial(u.String(), hdr)
+	dialer := *websocket.DefaultDialer
+	if addr := os.Getenv("ROXEY_RELAY_ADDR"); addr != "" { // force-dial a different address than the URL host
+		dialer.NetDialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, network, addr)
+		}
+	}
+	conn, resp, err := dialer.Dial(u.String(), hdr)
 	if err != nil {
-		return fmt.Errorf("connect: %w", err)
+		return fmt.Errorf("connect: %w%s", err, handshakeReason(resp))
 	}
 	defer conn.Close()
 
@@ -87,7 +112,7 @@ func Run(service, pathPrefix, target string) error {
 	}
 	defer sess.Close()
 
-	publicURL := fmt.Sprintf("https://%s.%s%s", service, cfg.Domain, pathPrefix)
+	publicURL := fmt.Sprintf("https://%s.%s%s", service, tld, pathPrefix)
 	fmt.Printf("[roxey] connected: %s -> %s\n", publicURL, target)
 
 	sig := make(chan os.Signal, 1)

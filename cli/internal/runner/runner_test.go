@@ -1,0 +1,58 @@
+package runner
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+const timeSecond = time.Second
+
+func TestWaitPortAndSpawn(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	port := portOf(t, srv)
+
+	if err := WaitPort(1, 300*time.Millisecond); err == nil {
+		t.Fatal("expected timeout against port 1")
+	}
+	if err := WaitPort(port, 2*timeSecond); err != nil {
+		t.Fatalf("WaitPort against live server: %v", err)
+	}
+}
+
+func TestSpawnDetached(t *testing.T) {
+	dir := t.TempDir()
+	logFile := filepath.Join(dir, "svc.log")
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer srv.Close()
+	free := portOf(t, srv) + 1
+
+	cmd := "python3 -m http.server " + itoa(free) + " --bind 127.0.0.1"
+	pid, err := Spawn(SpawnOptions{Name: "t", Cwd: dir, Command: cmd, Port: free, LogFile: logFile})
+	if err != nil {
+		t.Skipf("python3 unavailable or spawn failed: %v", err)
+	}
+	KillGroup(pid)
+	if _, err := os.Stat(logFile); err != nil {
+		t.Fatalf("log file not created: %v", err)
+	}
+}
+
+func portOf(t *testing.T, srv *httptest.Server) int {
+	t.Helper()
+	var port int
+	if _, err := fmt.Sscanf(srv.URL, "http://127.0.0.1:%d", &port); err != nil {
+		t.Fatal(err)
+	}
+	return port
+}
+
+func itoa(n int) string { return fmt.Sprintf("%d", n) }

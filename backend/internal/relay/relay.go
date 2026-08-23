@@ -51,6 +51,31 @@ type Registry struct {
 
 func NewRegistry() *Registry { return &Registry{table: make(map[string]*serviceTable)} }
 
+// Check reports whether a registration for service/pathPrefix would be
+// accepted, so callers can reject duplicates with a proper HTTP error
+// before upgrading the websocket.
+func (r *Registry) Check(service, pathPrefix string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	t, ok := r.table[service]
+	if !ok {
+		return nil
+	}
+	if pathPrefix == "" {
+		if t.root != nil {
+			return errors.New("service already in use")
+		}
+		return nil
+	}
+	for _, p := range t.prefixed {
+		if p.prefix == pathPrefix {
+			return errors.New("path already in use")
+		}
+	}
+	return nil
+}
+
 func (r *Registry) Register(service, pathPrefix string, sess *yamux.Session, remote string) (*Entry, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

@@ -19,8 +19,14 @@ type APIKey struct {
 
 type Store struct{ db *sql.DB }
 
+// Close releases the database handle.
+func (s *Store) Close() error { return s.db.Close() }
+
 func Open(path string) (*Store, error) {
-	db, err := sql.Open("sqlite", path)
+	// WAL + busy timeout so concurrent tunnel handshakes (each validating
+	// its API key with an UPDATE) don't fail with SQLITE_BUSY.
+	dsn := "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}

@@ -7,7 +7,9 @@ package main
 
 import (
 	"context"
+	"embed"
 	"encoding/json"
+	"io/fs"
 	"log"
 	"net"
 	"net/http"
@@ -24,6 +26,9 @@ import (
 	"roxey-relay/internal/store"
 )
 
+//go:embed web
+var webFS embed.FS
+
 func env(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -32,7 +37,7 @@ func env(key, def string) string {
 }
 
 func main() {
-	domain := env("ROXEY_DOMAIN", "roxey.run")
+	domain := env("ROXEY_DOMAIN", "f43.run")
 	adminHost := env("ROXEY_ADMIN_HOST", "relay."+domain)
 	adminUser := os.Getenv("ROXEY_ADMIN_USER")
 	adminPass := os.Getenv("ROXEY_ADMIN_PASS")
@@ -63,6 +68,12 @@ func main() {
 			host = host[:i]
 		}
 
+		if r.URL.Path == "/healthz" { // unauthenticated readiness probe
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok"))
+			return
+		}
+
 		if host == adminHost {
 			if r.URL.Path == "/_ws" {
 				handleWSUpgrade(upgrader, reg, st, w, r)
@@ -80,13 +91,23 @@ func main() {
 		handleTunnelRequest(reg, service, w, r)
 	})
 
-	log.Printf("roxey relay listening on :%s (admin host: %s, domain: *.%s)", port, adminHost, domain)
-	log.Fatal(http.ListenAndServe(":"+port, handler))
+	tlsCert, tlsKey := os.Getenv("ROXEY_TLS_CERT"), os.Getenv("ROXEY_TLS_KEY")
+	addr := ":" + port
+	if tlsCert != "" && tlsKey != "" {
+		log.Printf("roxey relay listening on https://%s (admin host: %s, domain: *.%s)", addr, adminHost, domain)
+		log.Fatal(http.ListenAndServeTLS(addr, tlsCert, tlsKey, handler))
+	}
+	log.Printf("roxey relay listening on http://%s (admin host: %s, domain: *.%s)", addr, adminHost, domain)
+	log.Fatal(http.ListenAndServe(addr, handler))
 }
 
 func buildMux(reg *relay.Registry, st *store.Store) http.Handler {
+	webRoot, err := fs.Sub(webFS, "web")
+	if err != nil {
+		log.Fatalf("embed web: %v", err)
+	}
 	mux := http.NewServeMux()
-	mux.Handle("/", http.FileServer(http.Dir("web")))
+	mux.Handle("/", http.FileServer(http.FS(webRoot)))
 
 	mux.HandleFunc("/api/tunnels", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, reg.ListActive())
@@ -166,6 +187,10 @@ func handleWSUpgrade(upgrader websocket.Upgrader, reg *relay.Registry, st *store
 	pathPrefix := r.URL.Query().Get("path")
 	if service == "" {
 		http.Error(w, "missing service", http.StatusBadRequest)
+		return
+	}
+	if err := reg.Check(service, pathPrefix); err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}
 

@@ -1,7 +1,7 @@
 {
   "name": "@abhikrishnaram/roxey",
   "version": "0.1.0",
-  "description": "CLI for Roxey — ngrok-style tunnels to *.roxey.run",
+  "description": "CLI for Roxey — ngrok-style tunnels to *.f43.run",
   "bin": {
     "roxey": "bin/roxey.js"
   },
