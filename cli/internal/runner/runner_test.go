@@ -56,3 +56,26 @@ func portOf(t *testing.T, srv *httptest.Server) int {
 }
 
 func itoa(n int) string { return fmt.Sprintf("%d", n) }
+
+func TestSplitCommand(t *testing.T) {
+	got, err := splitCommand(`bash -c 'set -a && source .env && exec air'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"bash", "-c", "set -a && source .env && exec air"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("got %q want %q", got, want)
+	}
+	if _, err := splitCommand(`echo 'unterminated`); err == nil {
+		t.Fatal("expected unterminated quote error")
+	}
+	got, err = splitCommand(`npm run dev -- --port 3000`)
+	if err != nil || len(got) != 6 {
+		t.Fatalf("plain split: %q %v", got, err)
+	}
+	// adjacent quoted and bare segments concatenate into one word
+	got, err = splitCommand(`echo "a b"c`)
+	if err != nil || fmt.Sprint(got) != `[echo a bc]` {
+		t.Fatalf("concatenation: %q %v", got, err)
+	}
+}

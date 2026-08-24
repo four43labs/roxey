@@ -116,9 +116,9 @@ func SpawnForeground(opts SpawnOptions, writeFn func(line string)) (int, <-chan 
 }
 
 func buildCmd(opts SpawnOptions, stdout, stderr *os.File) (*exec.Cmd, error) {
-	parts := strings.Fields(opts.Command)
-	if len(parts) == 0 {
-		return nil, fmt.Errorf("empty command")
+	parts, err := splitCommand(opts.Command)
+	if err != nil {
+		return nil, err
 	}
 	cmd := exec.Command(parts[0], parts[1:]...)
 	cmd.Dir = opts.Cwd
@@ -132,6 +132,56 @@ func buildCmd(opts SpawnOptions, stdout, stderr *os.File) (*exec.Cmd, error) {
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	return cmd, nil
+}
+
+// splitCommand parses a command line into words using shlex-style rules:
+// single- and double-quoted segments keep their spaces but lose their
+// quotes, so commands like
+//
+//	bash -c 'set -a && source .env && exec air'
+//
+// arrive at exec.Command as ["bash", "-c", "set -a && source .env && exec air"].
+func splitCommand(s string) ([]string, error) {
+	var (
+		out    []string
+		cur    strings.Builder
+		inWord bool
+		quote  byte
+	)
+	flush := func() {
+		if inWord {
+			out = append(out, cur.String())
+			cur.Reset()
+			inWord = false
+		}
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case quote != 0:
+			if c == quote {
+				quote = 0
+			} else {
+				cur.WriteByte(c)
+			}
+		case c == '\'' || c == '"':
+			inWord = true // a quote always continues or starts a word
+			quote = c
+		case c == ' ' || c == '\t' || c == '\n':
+			flush()
+		default:
+			inWord = true
+			cur.WriteByte(c)
+		}
+	}
+	if quote != 0 {
+		return nil, fmt.Errorf("unterminated %c quote in command %q", quote, s)
+	}
+	flush()
+	if len(out) == 0 {
+		return nil, fmt.Errorf("empty command")
+	}
+	return out, nil
 }
 
 // WaitPort polls until addr accepts TCP connections or timeout elapses.
