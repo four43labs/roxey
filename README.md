@@ -11,6 +11,7 @@ It is designed for the messy reality of modern local development: a frontend, a 
 - **Local relay mode** — run the relay backend on your own machine for instant `.localhost` HTTPS domains, complete with automatic CA generation and trust-store installation
 - **Everything streams** — tunnels are raw TCP pipes, so WebSockets, SSE, HMR, and large uploads just work
 - **Self-hostable** — use the hosted relay at `roxey.f43.run`, or deploy your own with a single Docker image
+- **Boot-time daemon** — install the local relay as a system service that survives reboots, with per-project autostart
 
 ## Getting Started
 
@@ -120,14 +121,14 @@ On first `up`, roxey downloads the relay binary, generates a local CA, asks once
 **One relay serves all your projects.** The default TLD is `dev`, and every project namespaces its hosts under its own name:
 
 ```yaml
-# verifycate/roxey.yaml                # zelion/roxey.yaml
-environments:                          environments:
-  - host: app.verifycate                 - host: shop.zelioncricket
-    ...                                    ...
-  - host: api.verifycate                 - host: api.zelioncricket
+# netflix/roxey.yaml
+environments:
+  - host: app.netflix
+    ...
+  - host: api.netflix
 ```
 
-→ `https://app.verifycate.dev` and `https://shop.zelioncricket.dev` run simultaneously against the same `roxey.dev`. Certificates and `/etc/hosts` entries are cumulative across projects; `down` removes only that project's names.
+→ `https://app.netflix.dev` and `https://api.netflix.dev` run against the same `roxey.dev` as any other project you `up` (each claims its own namespace, like `*.stripe` or `*.linear`). Certificates and `/etc/hosts` entries are cumulative across projects; `down` removes only that project's names.
 
 Any explicit `tld:` is still honored (`tld: localhost` for native-resolving names, or a production-shaped domain like `dev.mycompany.dev`).
 
@@ -148,8 +149,8 @@ Keep the local relay alive across reboots, and optionally bring projects up at l
 
 ```bash
 roxey service install                  # relay daemon: starts at boot, restarts on crash
-roxey projects --autostart verifycate  # also bring this project up at login
-roxey projects --autostart-off verifycate
+roxey projects --autostart netflix  # also bring this project up at login
+roxey projects --autostart-off netflix
 roxey service status                   # daemon state + autostart list
 roxey service uninstall                # remove everything
 ```
@@ -162,11 +163,11 @@ The first `roxey up` in a project registers it in `~/.roxey/projects.json`. Afte
 
 ```bash
 roxey projects                    # all known projects + live status
-roxey up --project verifycate     # bring up from anywhere
-roxey down --project verifycate   # tear down just that project
+roxey up --project netflix     # bring up from anywhere
+roxey down --project netflix   # tear down just that project
 roxey logs <service-name>         # tail a detached service
-roxey doctor --project verifycate # diagnose one project
-roxey projects --forget verifycate  # drop a project from the registry
+roxey doctor --project netflix # diagnose one project
+roxey projects --forget netflix  # drop a project from the registry
 roxey projects --prune            # GC projects whose directories are gone
 ```
 
@@ -177,9 +178,9 @@ Status is always derived live — the registry stores only identity (name, path,
 Run `roxey up` inside a linked git worktree and roxey automatically creates an *isolated preview*: environment hosts get the branch slug as prefix, services get fresh auto-assigned ports, and everything registers as its own project.
 
 ```bash
-cd ~/projects/verifycate.worktrees/fix-13-auth   # a git worktree
-roxey up                                          # → https://fix-13-app-verifycate.dev
-                                                  # → https://fix-13-api-verifycate.dev
+cd ~/projects/netflix.worktrees/fix-13-auth   # a git worktree
+roxey up                                          # → https://fix-13-app-netflix.dev
+                                                  # → https://fix-13-api-netflix.dev
 
 roxey projects                                    # main + preview listed side by side
 roxey down                                        # tears down only this fork
@@ -191,9 +192,9 @@ To keep forks pointing at *their own* services instead of the main checkout's, r
 
 ```yaml
 environment:
-  NEXT_PUBLIC_API_URL: https://{{host:api.verifycate}}/api/v1
-  # → resolves to https://fix-13-api-verifycate.dev/api/v1 in the fork,
-  #   https://api.verifycate.dev on the main checkout — same yaml file everywhere
+  NEXT_PUBLIC_API_URL: https://{{host:api.netflix}}/api/v1
+  # → resolves to https://fix-13-api-netflix.dev/api/v1 in the fork,
+  #   https://api.netflix.dev on the main checkout — same yaml file everywhere
 ```
 
 Note: stateful dependencies stay shared — a preview talks to the same Postgres unless you give it its own.
@@ -232,6 +233,10 @@ roxey stop <service>[/path]
 
 roxey list
   # List live tunnels and spawned services on this machine
+
+roxey service install|uninstall|status
+  # Manage the boot-time relay daemon (launchd/systemd); status shows
+  # daemon state and which projects have autostart enabled
 ```
 
 Environment variables:
