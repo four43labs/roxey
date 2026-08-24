@@ -44,3 +44,14 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Trigger deploy webhook
+        run: |
+          tags_json=$(jq -R -s -c 'split("\n") | map(select(length > 0))' <<< "${{ steps.meta.outputs.tags }}")
+          curl -fsS -X POST "$WEBHOOK_URL" \
+            -H "X-Deploy-Token: $DEPLOY_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"image\":\"ghcr.io/${{ github.repository_owner }}/roxey-relay\",\"tags\":$tags_json}"
+        env:
+          WEBHOOK_URL: ${{ secrets.DEPLOY_WEBHOOK_URL }}
+          DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
