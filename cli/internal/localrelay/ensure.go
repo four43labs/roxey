@@ -9,6 +9,7 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -288,11 +289,13 @@ func mustJSON(s string) string {
 
 func randomToken() string {
 	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-	b := make([]byte, 24)
-	now := time.Now().UnixNano()
-	for i := range b {
-		now = now*6364136223846793005 + 1442695040888963407
-		b[i] = charset[int(now>>33)%len(charset)]
+	raw := make([]byte, 24)
+	if _, err := rand.Read(raw); err != nil {
+		panic("crypto/rand unavailable: " + err.Error())
 	}
-	return string(b)
+	out := make([]byte, len(raw))
+	for i, b := range raw {
+		out[i] = charset[int(b)%len(charset)]
+	}
+	return string(out)
 }
