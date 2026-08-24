@@ -90,7 +90,7 @@ func writeHosts(newBlock string) error {
 	}
 	cmd := exec.Command("sudo", "-p", "roxey needs admin rights to update /etc/hosts: ",
 		"cp", tmp.Name(), "/etc/hosts")
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	cmd.Stdin = os.Stdin
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("update /etc/hosts: %v: %s", err, out)
 	}
