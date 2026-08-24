@@ -10,6 +10,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
+	"crypto/tls"
 	"embed"
 	"encoding/hex"
 	"encoding/json"
@@ -22,6 +23,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -124,11 +126,51 @@ func main() {
 	tlsCert, tlsKey := os.Getenv("ROXEY_TLS_CERT"), os.Getenv("ROXEY_TLS_KEY")
 	addr := ":" + port
 	if tlsCert != "" && tlsKey != "" {
+		// Serve certs via a reloading getter: the local CA re-issues the
+		// leaf whenever a project adds a host, and the running relay should
+		// pick that up without a restart.
+		loader := &certLoader{certFile: tlsCert, keyFile: tlsKey}
 		log.Printf("roxey relay listening on https://%s (admin host: %s, domain: *.%s)", addr, adminHost, domain)
-		log.Fatal(http.ListenAndServeTLS(addr, tlsCert, tlsKey, handler))
+		srv := &http.Server{
+			Addr:    addr,
+			Handler: handler,
+			TLSConfig: &tls.Config{
+				GetCertificate: loader.GetCertificate,
+			},
+		}
+		log.Fatal(srv.ListenAndServeTLS("", ""))
 	}
 	log.Printf("roxey relay listening on http://%s (admin host: %s, domain: *.%s)", addr, adminHost, domain)
 	log.Fatal(http.ListenAndServe(addr, handler))
+}
+
+// certLoader serves the TLS keypair from disk, re-reading it when the
+// files' modification time changes.
+type certLoader struct {
+	certFile, keyFile string
+
+	mu      sync.Mutex
+	cached  *tls.Certificate
+	modTime time.Time
+}
+
+func (c *certLoader) GetCertificate(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	fi, err := os.Stat(c.certFile)
+	if err == nil && c.cached != nil && fi.ModTime().Equal(c.modTime) {
+		return c.cached, nil
+	}
+	cert, err := tls.LoadX509KeyPair(c.certFile, c.keyFile)
+	if err != nil {
+		if c.cached != nil {
+			return c.cached, nil // keep serving the previous cert on errors
+		}
+		return nil, err
+	}
+	c.cached, c.modTime = &cert, fi.ModTime()
+	return c.cached, nil
 }
 
 // loadSessionSecret returns ROXEY_SESSION_SECRET or a random secret
