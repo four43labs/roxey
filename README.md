@@ -149,6 +149,9 @@ roxey down [file]
 roxey logs <name>
   # Tail the log of a service started with `up -d`
 
+roxey doctor [roxey.yaml]
+  # Diagnose state, relays, certs, and ports; exit 1 on any failure
+
 roxey start <service>[/path/*] <target>
   # Start an ad-hoc tunnel, e.g. roxey start myapp localhost:3000
 

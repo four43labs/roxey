@@ -177,18 +177,20 @@ func issueLeaf(caCert *x509.Certificate, caKey *ecdsa.PrivateKey, hosts []string
 	return leafDER, keyDER, nil
 }
 
-// Trusted reports whether a cert chain signed by our CA verifies against the
-// system trust store (i.e. we can skip the sudo install).
+// Trusted reports whether certificates signed by our CA verify against the
+// system trust store. It verifies the issued leaf (not the CA itself —
+// self-signed roots fail self-verification quirks) against the OS pool.
 func Trusted(caPath string) bool {
-	pemBytes, err := os.ReadFile(caPath)
+	leafPath := filepath.Join(filepath.Dir(caPath), leafCertFile)
+	leafPEM, err := os.ReadFile(leafPath)
 	if err != nil {
 		return false
 	}
-	block, _ := pem.Decode(pemBytes)
+	block, _ := pem.Decode(leafPEM)
 	if block == nil {
 		return false
 	}
-	ca, err := x509.ParseCertificate(block.Bytes)
+	leaf, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
 		return false
 	}
@@ -196,8 +198,8 @@ func Trusted(caPath string) bool {
 	if err != nil {
 		return false
 	}
-	opts := x509.VerifyOptions{Roots: roots, DNSName: ca.Subject.CommonName}
-	_, err = ca.Verify(opts)
+	opts := x509.VerifyOptions{Roots: roots} // no DNSName: any covered host proves trust
+	_, err = leaf.Verify(opts)
 	return err == nil
 }
 

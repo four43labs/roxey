@@ -11,11 +11,13 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
 
 	"roxey/internal/config"
+	"roxey/internal/doctor"
 	"roxey/internal/localca"
 	"roxey/internal/localrelay"
 	"roxey/internal/manifest"
@@ -54,6 +56,8 @@ func main() {
 		err = cmdDown(os.Args[2:])
 	case "logs":
 		err = cmdLogs(os.Args[2:])
+	case "doctor":
+		err = cmdDoctor(os.Args[2:])
 	case "_run": // internal: background tunnel worker
 		err = cmdRun(os.Args[2:])
 	default:
@@ -74,6 +78,7 @@ Commands:
   up [-d] [roxey.yaml]                Bring up a manifest's environments
   down [roxey.yaml]                   Tear down a manifest's tunnels + services
   logs <name>                         Tail a service started by ` + "`up -d`" + `
+  doctor [roxey.yaml]                 Diagnose state, relays, certs, and ports
   start <service>[/path/*] <target>   Ad-hoc tunnel, e.g. roxey start myapp localhost:3000
   stop <service>[/path]               Stop a running tunnel
   list                                List tunnels running on this machine`)
@@ -694,6 +699,122 @@ func sameHost(key string, m *manifest.Manifest) bool {
 		}
 	}
 	return false
+}
+
+// ── doctor ───────────────────────────────────────────────────────────────
+
+func cmdDoctor(args []string) error {
+	file := ""
+	for _, a := range args {
+		if strings.HasPrefix(a, "-") {
+			continue
+		}
+		if file == "" {
+			file = a
+		}
+	}
+
+	rep := &doctor.Report{}
+	doctor.CheckState(rep)
+
+	// Relay checks for every registered TLD; remember which were covered so
+	// the manifest section doesn't duplicate them.
+	checkedRelay := map[string]bool{}
+	cfg, _ := config.LoadConfig()
+	if cfg != nil {
+		tlds := make([]string, 0, len(cfg.Servers))
+		for tld := range cfg.Servers {
+			tlds = append(tlds, tld)
+		}
+		sort.Strings(tlds)
+		for _, tld := range tlds {
+			if sc := cfg.Servers[tld]; sc.Local {
+				doctor.CheckLocalRelay(rep, tld)
+			} else {
+				doctor.CheckRemoteRelay(rep, tld)
+			}
+			checkedRelay[tld] = true
+		}
+	}
+
+	// Manifest checks when one is available.
+	if file == "" {
+		if _, err := os.Stat("roxey.yaml"); err == nil {
+			file = "roxey.yaml"
+		}
+	}
+	if file != "" {
+		m, err := manifest.Load(file)
+		if err != nil {
+			rep.Failf("fix the errors above in "+file, "manifest %s is invalid", file)
+		} else {
+			fmt.Printf("manifest: %s\n", file)
+			mi := doctor.ManifestInfo{
+				TLD:             m.RelayServer.TLD,
+				Local:           m.RelayServer.Local,
+				HasAPIKey:       m.RelayServer.APIKey != "",
+				SkipRelayChecks: checkedRelay[m.RelayServer.TLD],
+				OwnedPorts:      map[int]string{},
+			}
+			if !mi.HasAPIKey {
+				if sc, ok := config.ServerFor(m.RelayServer.TLD); ok {
+					mi.HasAPIKey = sc.APIKey != ""
+				}
+			}
+			// Ports held by this project's own live services are fine.
+			services, _ := config.LoadServices()
+			manifestAbs, _ := filepath.Abs(file)
+			for _, svc := range services {
+				if svc.ManifestPath == manifestAbs && processAlive(svc.PID) {
+					mi.OwnedPorts[svc.Port] = svc.Name
+				}
+			}
+			for ei := range m.Environments {
+				e := &m.Environments[ei]
+				for ri := range e.Routes {
+					r := &e.Routes[ri]
+					if r.IsRun() {
+						mi.RunRoutes = append(mi.RunRoutes, doctor.RunRoute{
+							Name: e.Host + r.Path, Cwd: r.Cwd, Command: r.Command, Port: r.Port,
+						})
+					} else {
+						mi.ProxyTargs = append(mi.ProxyTargs, r.Target)
+					}
+				}
+			}
+			doctor.CheckManifest(rep, mi)
+		}
+	}
+	// Print.
+	for _, res := range rep.Results {
+		sym := "✓"
+		switch res.Status {
+		case doctor.Warn:
+			sym = "!"
+		case doctor.Fail:
+			sym = "✗"
+		}
+		fmt.Printf(" %s  %s\n", sym, res.Msg)
+		if res.Fix != "" && res.Status != doctor.OK {
+			fmt.Printf("      fix: %s\n", res.Fix)
+		}
+	}
+	fails := 0
+	warns := 0
+	for _, res := range rep.Results {
+		switch res.Status {
+		case doctor.Warn:
+			warns++
+		case doctor.Fail:
+			fails++
+		}
+	}
+	fmt.Printf("\n%d ok, %d warning(s), %d failure(s)\n",
+		len(rep.Results)-fails-warns, warns, fails)
+	if fails > 0 {
+		return fmt.Errorf("doctor found %d failure(s)", fails)
+	}
+	return nil
 }
 
 // ── logs ─────────────────────────────────────────────────────────────────
