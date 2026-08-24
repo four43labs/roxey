@@ -37,7 +37,7 @@ const (
 // BinPath returns where the relay binary lives (or will live).
 func BinPath() string { return filepath.Join(config.BinDir(), binaryName) }
 
-// HealthOK probes https://relay.<tld>/healthz through our CA without
+// HealthOK probes https://roxey.<tld>/healthz through our CA without
 // relying on the OS trust store.
 func HealthOK(tld string) bool {
 	client, err := healthClient(tld)
@@ -57,10 +57,16 @@ func HealthOK(tld string) bool {
 	return resp.StatusCode == http.StatusOK
 }
 
-func RelayHost(tld string) string { return "relay." + tld }
+// AdminSubdomain is the hostname prefix every relay answers on:
+// roxey.<tld>. (Historically "roxey.<tld>"; renamed to avoid colliding with
+// real domains like relay.dev.)
+const AdminSubdomain = "roxey"
+
+// RelayHost returns the admin/WS hostname for a TLD: roxey.<tld>.
+func RelayHost(tld string) string { return AdminSubdomain + "." + tld }
 
 // healthClient builds an HTTP client that dials 127.0.0.1 but presents SNI
-// for relay.<tld> and verifies against our local CA.
+// for roxey.<tld> and verifies against our local CA.
 func healthClient(tld string) (*http.Client, error) {
 	caPEM, err := os.ReadFile(filepath.Join(config.CertDir(), "ca.crt"))
 	if err != nil {
@@ -204,7 +210,7 @@ func EnsureRunning(tld string) error {
 	sc, _ := config.ServerFor(tld)
 	adminUser, adminPass := sc.AdminUser, sc.AdminPass
 	if adminUser == "" || adminPass == "" {
-		adminUser, adminPass = randomToken(), randomToken()
+		adminUser, adminPass = RandomToken(), RandomToken()
 	}
 
 	certDir := config.CertDir()
@@ -287,7 +293,8 @@ func mustJSON(s string) string {
 	return string(b)
 }
 
-func randomToken() string {
+// RandomToken returns a DNS-safe random string (admin credentials).
+func RandomToken() string {
 	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 	raw := make([]byte, 24)
 	if _, err := rand.Read(raw); err != nil {

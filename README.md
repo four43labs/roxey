@@ -10,7 +10,7 @@ It is designed for the messy reality of modern local development: a frontend, a 
 - **Service spawning** — roxey can run your dev commands itself (portless-style), inject `PORT`/`HOST`/custom env vars, wait for readiness, and clean up on Ctrl-C
 - **Local relay mode** — run the relay backend on your own machine for instant `.localhost` HTTPS domains, complete with automatic CA generation and trust-store installation
 - **Everything streams** — tunnels are raw TCP pipes, so WebSockets, SSE, HMR, and large uploads just work
-- **Self-hostable** — use the hosted relay at `relay.f43.run`, or deploy your own with a single Docker image
+- **Self-hostable** — use the hosted relay at `roxey.f43.run`, or deploy your own with a single Docker image
 
 ## Getting Started
 
@@ -37,7 +37,7 @@ cd cli && go build -o roxey . && mv roxey /usr/local/bin/
 
 ### Authenticating
 
-Create an API key on the [relay dashboard](https://relay.f43.run) (Basic Auth), then:
+Create an API key on the [relay dashboard](https://roxey.f43.run) (Basic Auth), then:
 
 ```bash
 roxey auth <api-key-from-dashboard>
@@ -77,7 +77,7 @@ For multi-service projects, declare everything in a manifest instead of running 
 
 ```yaml
 relay_server:
-  tld: f43.run              # remote relay at relay.f43.run
+  tld: f43.run              # remote relay at roxey.f43.run
   # api_key: rxy_...        # optional; falls back to saved auth state
   # local: true             # or run the relay locally (see below)
 
@@ -127,7 +127,7 @@ environments:                          environments:
   - host: api.verifycate                 - host: api.zelioncricket
 ```
 
-→ `https://app.verifycate.dev` and `https://shop.zelioncricket.dev` run simultaneously against the same `relay.dev`. Certificates and `/etc/hosts` entries are cumulative across projects; `down` removes only that project's names.
+→ `https://app.verifycate.dev` and `https://shop.zelioncricket.dev` run simultaneously against the same `roxey.dev`. Certificates and `/etc/hosts` entries are cumulative across projects; `down` removes only that project's names.
 
 Any explicit `tld:` is still honored (`tld: localhost` for native-resolving names, or a production-shaped domain like `dev.mycompany.dev`).
 
@@ -140,7 +140,21 @@ Any explicit `tld:` is still honored (`tld: localhost` for native-resolving name
 
 - OAuth callbacks work as-is under a custom TLD: register the callback URL once and it works across every branch.
 - Give each service its own host (`api.*`, `admin.*`) rather than path prefixes when apps hard-code origins or cookies.
-- The relay keeps running after `roxey down` so subsequent `up`s are instant; stop it manually with `pkill roxey-relay`.
+- The relay keeps running after `roxey down` so subsequent `up`s are instant; stop it manually with `pkill roxey-relay` — or install it as a boot daemon (below).
+
+### Boot-time service (Docker Desktop-style)
+
+Keep the local relay alive across reboots, and optionally bring projects up at login:
+
+```bash
+roxey service install                  # relay daemon: starts at boot, restarts on crash
+roxey projects --autostart verifycate  # also bring this project up at login
+roxey projects --autostart-off verifycate
+roxey service status                   # daemon state + autostart list
+roxey service uninstall                # remove everything
+```
+
+macOS uses a root LaunchDaemon (`KeepAlive`) plus per-project user LaunchAgents; Linux uses systemd system/user units. The daemon replays the same commands you would run by hand — nothing about your manifests changes.
 
 ### Multiple projects from anywhere
 
@@ -225,7 +239,7 @@ Environment variables:
 | Variable | Purpose |
 |---|---|
 | `ROXEY_DOMAIN` | Default TLD when no manifest/flag specifies one (default: `f43.run`) |
-| `ROXEY_RELAY_HOST` | Override the relay hostname (`relay.<tld>` by default) |
+| `ROXEY_RELAY_HOST` | Override the relay hostname (`roxey.<tld>` by default) |
 | `ROXEY_INSECURE=1` | Connect tunnels over plain `ws://` (testing relays without TLS) |
 | `ROXEY_RELAY_BIN` | Use a local relay binary instead of downloading one |
 
@@ -240,11 +254,11 @@ flowchart LR
         W --> BE[":8000 backend"]
     end
 
-    B["browser / curl"] -- "https://shop.f43.run/api/..." --> R["relay<br/>(relay.f43.run)"]
+    B["browser / curl"] -- "https://shop.f43.run/api/..." --> R["relay<br/>(roxey.f43.run)"]
     R <-- "one yamux WebSocket,<br/>many raw TCP streams" --> W
 ```
 
-1. `roxey start` (or `up`) spawns a background worker that opens a single WebSocket to the relay at `wss://relay.<tld>/_ws`, authenticated with your API key.
+1. `roxey start` (or `up`) spawns a background worker that opens a single WebSocket to the relay at `wss://roxey.<tld>/_ws`, authenticated with your API key.
 2. The relay registers that connection under the requested service name (and path prefix, if any).
 3. A public request to `https://<service>.<tld>/...` is streamed over a fresh raw TCP stream, multiplexed through the CLI's WebSocket with yamux. The CLI dials the local target's port and pipes bytes in both directions until either side closes.
 4. When the worker disconnects (`roxey stop`, Ctrl-C, network loss), the relay deregisters the route immediately.
@@ -263,7 +277,7 @@ The repository is two independent Go modules plus an npm wrapper:
 
 ## Choosing the Relay Backend
 
-By default the CLI talks to the relay operated by Four43 Labs at `relay.f43.run` — no setup beyond `roxey auth`. You have three options, selected per project in the manifest's `relay_server` block:
+By default the CLI talks to the relay operated by Four43 Labs at `roxey.f43.run` — no setup beyond `roxey auth`. You have three options, selected per project in the manifest's `relay_server` block:
 
 1. **Hosted relay** (default) — `tld: f43.run`; public HTTPS URLs out of the box.
 2. **Local relay** (`local: true`) — the relay runs on your machine; see [Local development domains](#local-development-domains-local-relay-mode). Best for solo dev with production-shaped URLs and nothing exposed externally.
@@ -282,14 +296,14 @@ docker run -d -p 8080:8080 \
   ghcr.io/four43labs/roxey-relay:latest
 ```
 
-The relay writes its SQLite database to `/data/roxey.db` (`ROXEY_DB_PATH`); mount the volume so API keys survive restarts. Then visit `https://relay.your-domain.com` to generate keys, and authenticate clients with `ROXEY_DOMAIN=your-domain.com roxey auth <key>`.
+The relay writes its SQLite database to `/data/roxey.db` (`ROXEY_DB_PATH`); mount the volume so API keys survive restarts. Then visit `https://roxey.your-domain.com` to generate keys, and authenticate clients with `ROXEY_DOMAIN=your-domain.com roxey auth <key>`.
 
 Additional server options:
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `PORT` | `8080` | Listen port |
-| `ROXEY_ADMIN_HOST` | `relay.<domain>` | Host serving the admin API/dashboard |
+| `ROXEY_ADMIN_HOST` | `roxey.<domain>` | Host serving the admin API/dashboard |
 | `ROXEY_DB_PATH` | `roxey.db` | SQLite location |
 | `ROXEY_TLS_CERT` / `ROXEY_TLS_KEY` | unset | Serve HTTPS directly (otherwise terminate TLS upstream) |
 

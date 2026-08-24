@@ -38,7 +38,7 @@ func env(key, def string) string {
 
 func main() {
 	domain := env("ROXEY_DOMAIN", "f43.run")
-	adminHost := env("ROXEY_ADMIN_HOST", "relay."+domain)
+	adminHost := env("ROXEY_ADMIN_HOST", "roxey."+domain)
 	adminUser := os.Getenv("ROXEY_ADMIN_USER")
 	adminPass := os.Getenv("ROXEY_ADMIN_PASS")
 	dbPath := env("ROXEY_DB_PATH", "roxey.db")

@@ -29,7 +29,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "== starting relay =="
-ROXEY_DOMAIN=smoke.localhost ROXEY_ADMIN_HOST=relay.smoke.localhost \
+ROXEY_DOMAIN=smoke.localhost ROXEY_ADMIN_HOST=roxey.smoke.localhost \
 ROXEY_ADMIN_USER=admin ROXEY_ADMIN_PASS=pass PORT=18080 \
 ROXEY_DB_PATH="$WORK/relay.db" "$RELAY" >"$WORK/relay.log" 2>&1 &
 
@@ -40,7 +40,7 @@ done
 check "healthz" "curl -sf http://127.0.0.1:18080/healthz | grep -q ok"
 
 # Admin API lives on the admin host, so requests must carry its Host header.
-admin_req() { curl -sf -H "Host: relay.smoke.localhost" -u admin:pass "$@"; }
+admin_req() { curl -sf -H "Host: roxey.smoke.localhost" -u admin:pass "$@"; }
 KEY=$(admin_req -X POST http://127.0.0.1:18080/api/keys \
   -d '{"label":"smoke"}' | sed -n 's/.*"apiKey":"\([^"]*\)".*/\1/p')
 check "api key created" "[ -n \"$KEY\" ]"
@@ -51,7 +51,7 @@ sleep 0.4
 
 echo "== roxey start (ad-hoc tunnel) =="
 export ROXEY_DOMAIN=smoke.localhost
-export ROXEY_RELAY_HOST=relay.smoke.localhost
+export ROXEY_RELAY_HOST=roxey.smoke.localhost
 export ROXEY_RELAY_ADDR=127.0.0.1:18080
 export ROXEY_INSECURE=1
 printf '{"servers": {"smoke.localhost": {"apiKey": "%s"}}}' "$KEY" > "$FAKEHOME/.roxey/config.json"

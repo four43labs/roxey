@@ -23,7 +23,7 @@ func NeedsHosts(tld string) bool {
 }
 
 // HostsEntries returns the loopback hostnames to sync for a manifest:
-// relay.<tld> plus every environment host.
+// roxey.<tld> plus every environment host.
 func HostsEntries(tld string, envHosts []string) []string {
 	out := []string{RelayHost(tld)}
 	for _, h := range envHosts {

@@ -21,6 +21,8 @@ import (
 	"runtime"
 	"sort"
 	"time"
+
+	"roxey/internal/config"
 )
 
 const (
@@ -86,8 +88,7 @@ func Ensure(hosts []string) (Result, error) {
 }
 
 func certDir() string {
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".roxey", "certs")
+	return config.CertDir()
 }
 
 // covers reports whether the parsed leaf includes every hostname.

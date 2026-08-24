@@ -167,7 +167,7 @@ func CheckLocalRelay(r *Report, tld string) {
 	// Port 443 ownership.
 	switch {
 	case localrelay.HealthOK(tld):
-		r.OKf("local relay healthy at relay.%s (port 443)", tld)
+		r.OKf("local relay healthy at roxey.%s (port 443)", tld)
 	case portInUse("127.0.0.1:443"):
 		culprit := portOwner(":443")
 		msg := "port 443 is occupied by another process"
@@ -177,7 +177,7 @@ func CheckLocalRelay(r *Report, tld string) {
 		r.Failf("stop that process (e.g. `portless proxy stop`, `sudo lsof -i :443`) before `roxey up`", "%s", msg)
 	default:
 		r.Failf("start it with `roxey up` on any manifest with `relay_server.local: true`",
-			"port 443 free but relay.%s is not running", tld)
+			"port 443 free but roxey.%s is not running", tld)
 	}
 
 	CheckHostsBlock(r, tld)
@@ -212,7 +212,7 @@ func CheckHostsBlock(r *Report, tld string) {
 
 // ── remote relays ────────────────────────────────────────────────────────
 
-// CheckRemoteRelay verifies DNS, TCP, and TLS for relay.<tld>.
+// CheckRemoteRelay verifies DNS, TCP, and TLS for roxey.<tld>.
 func CheckRemoteRelay(r *Report, tld string) {
 	host := localrelay.RelayHost(tld)
 	ips, err := net.LookupIP(host)

@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"syscall"
@@ -24,6 +25,7 @@ import (
 	"roxey/internal/preview"
 	"roxey/internal/projects"
 	"roxey/internal/runner"
+	"roxey/internal/service"
 	"roxey/internal/tunnel"
 )
 
@@ -62,6 +64,10 @@ func main() {
 		err = cmdLogs(os.Args[2:])
 	case "doctor":
 		err = cmdDoctor(os.Args[2:])
+	case "service":
+		err = cmdService(os.Args[2:])
+	case "_service-relay": // internal: boot-time relay entrypoint (runs as root)
+		err = cmdServiceRelay(os.Args[2:])
 	case "_run": // internal: background tunnel worker
 		err = cmdRun(os.Args[2:])
 	default:
@@ -82,6 +88,7 @@ Commands:
   up [-d] [--preview[=slug]] [file]   Bring up a manifest's environments
   down [file]                         Tear down a manifest's tunnels + services
   projects [--forget n] [--prune]     List known projects and their status
+  service install|uninstall|status    Manage the boot-time relay daemon
   logs <name>                         Tail a service started by ` + "`up -d`" + `
   doctor [roxey.yaml]                 Diagnose state, relays, certs, and ports
   start <service>[/path/*] <target>   Ad-hoc tunnel, e.g. roxey start myapp localhost:3000
@@ -890,6 +897,28 @@ func cmdDoctor(args []string) error {
 		}
 	}
 
+	// Boot-service status.
+	if runtime.GOOS == "darwin" || runtime.GOOS == "linux" {
+		fmt.Printf("service:\n")
+		fmt.Printf("  relay daemon:  %s\n", onOff(service.RelayRunning()))
+		reg2, _ := projects.Load()
+		var auto []string
+		for _, n := range reg2.SortedNames() {
+			if p := reg2.Projects[n]; p.AutoStart && !p.Preview {
+				state := "agent missing"
+				if service.ProjectAgentInstalled(n) {
+					state = "installed"
+				}
+				auto = append(auto, n+" ("+state+")")
+			}
+		}
+		if len(auto) == 0 {
+			fmt.Println("  autostart:     none")
+		} else {
+			fmt.Printf("  autostart:     %s\n", strings.Join(auto, ", "))
+		}
+	}
+
 	// Manifest checks when one is available.
 	if file == "" {
 		if _, err := os.Stat("roxey.yaml"); err == nil {
@@ -970,10 +999,193 @@ func cmdDoctor(args []string) error {
 	return nil
 }
 
+// ── service (boot-time relay + autostart) ────────────────────────────────
+
+// cmdServiceRelay is the boot-time entrypoint (runs as root, launched by
+// launchd/systemd): it targets the real user's state directory, provisions
+// certs for every registered local project, then execs the relay binary on
+// port 443. The daemon supervisor restarts us if we ever exit.
+func cmdServiceRelay(args []string) error {
+	stateDir := ""
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--state-dir" && i+1 < len(args) {
+			i++
+			stateDir = args[i]
+		}
+	}
+	if stateDir == "" {
+		return fmt.Errorf("_service-relay requires --state-dir")
+	}
+	config.SetDir(stateDir)
+
+	reg, err := projects.Load()
+	if err != nil {
+		return err
+	}
+	tld := primaryLocalTLDFromRegistry(reg)
+	if tld == "" {
+		return fmt.Errorf("no local projects registered; nothing to serve")
+	}
+
+	hosts := reg.AllLocalHostFQDNs()
+	if tld == "localhost" {
+		hosts = append(hosts, "localhost")
+	}
+	res, err := localca.Ensure(dedupe(hosts))
+	if err != nil {
+		return fmt.Errorf("certs: %w", err)
+	}
+	if !localca.Trusted(res.CAPath) { // as root this needs no password
+		if err := localca.TrustCA(res.CAPath); err != nil {
+			fmt.Fprintln(os.Stderr, "[service] warning: could not trust CA:", err)
+		}
+	}
+
+	sc, _ := config.ServerFor(tld)
+	adminUser, adminPass := sc.AdminUser, sc.AdminPass
+	if adminUser == "" || adminPass == "" {
+		adminUser, adminPass = localrelay.RandomToken(), localrelay.RandomToken()
+		_ = config.SetServer(tld, config.ServerConfig{
+			Local: true, AdminUser: adminUser, AdminPass: adminPass, APIKey: sc.APIKey,
+		})
+	}
+
+	bin, err := localrelay.EnsureBinary()
+	if err != nil {
+		return fmt.Errorf("relay binary: %w", err)
+	}
+
+	certDir := config.CertDir()
+	env := append(os.Environ(),
+		"ROXEY_DOMAIN="+tld,
+		"ROXEY_ADMIN_HOST=roxey."+tld,
+		"ROXEY_ADMIN_USER="+adminUser,
+		"ROXEY_ADMIN_PASS="+adminPass,
+		"ROXEY_DB_PATH="+filepath.Join(stateDir, "local_"+strings.ReplaceAll(tld, ".", "_")+".db"),
+		"PORT=443",
+		"ROXEY_TLS_CERT="+filepath.Join(certDir, "leaf.crt"),
+		"ROXEY_TLS_KEY="+filepath.Join(certDir, "leaf.key"),
+	)
+	fmt.Printf("[service] starting relay for *.%s at roxey.%s\n", tld, tld)
+	return syscall.Exec(bin, []string{bin}, env)
+}
+
+// primaryLocalTLD picks the TLD the shared relay serves: "dev" when any
+// project uses the default, else the first registered local TLD.
+func primaryLocalTLD() string {
+	reg, err := projects.Load()
+	if err != nil {
+		return manifest.DefaultLocalTLD
+	}
+	return primaryLocalTLDFromRegistry(reg)
+}
+
+func primaryLocalTLDFromRegistry(reg *projects.Registry) string {
+	first := ""
+	for _, n := range reg.SortedNames() {
+		p := reg.Projects[n]
+		if !p.Local {
+			continue
+		}
+		if p.TLD == manifest.DefaultLocalTLD {
+			return p.TLD
+		}
+		if first == "" {
+			first = p.TLD
+		}
+	}
+	if first != "" {
+		return first
+	}
+	return manifest.DefaultLocalTLD
+}
+
+func onOff(b bool) string {
+	if b {
+		return "installed/running"
+	}
+	return "not installed"
+}
+
+func cmdService(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: roxey service <install|uninstall|status>")
+	}
+	mgr, err := service.NewManager()
+	if err != nil {
+		return err
+	}
+
+	switch args[0] {
+	case "install":
+		reg, err := projects.Load()
+		if err != nil {
+			return err
+		}
+		if err := mgr.InstallRelay(); err != nil {
+			return fmt.Errorf("install relay daemon: %w", err)
+		}
+		fmt.Println("[service] relay installed (starts at boot, restarts on crash)")
+		for _, name := range reg.SortedNames() {
+			p := reg.Projects[name]
+			if p.AutoStart && !p.Preview {
+				if err := mgr.InstallProjectAgent(name); err != nil {
+					fmt.Fprintf(os.Stderr, "warning: autostart agent for %s: %v\n", name, err)
+					continue
+				}
+				fmt.Printf("[service] autostart enabled for %s\n", name)
+			}
+		}
+		return nil
+
+	case "uninstall":
+		reg, _ := projects.Load()
+		for _, name := range reg.SortedNames() {
+			if p := reg.Projects[name]; p.AutoStart && !p.Preview {
+				_ = mgr.UninstallProjectAgent(name)
+			}
+		}
+		if err := mgr.UninstallRelay(); err != nil {
+			return err
+		}
+		fmt.Println("[service] relay daemon removed.")
+		return nil
+
+	case "status":
+		installed := service.RelayRunning() // loaded implies installed
+		_ = installed
+		tld := primaryLocalTLD()
+		fmt.Printf("relay daemon:  %s\n", onOff(service.RelayRunning()))
+		if localrelay.HealthOK(tld) {
+			fmt.Printf("relay health:  ok (roxey.%s)\n", tld)
+		} else {
+			fmt.Printf("relay health:  NOT responding\n")
+		}
+		reg, _ := projects.Load()
+		var auto []string
+		for _, n := range reg.SortedNames() {
+			p := reg.Projects[n]
+			if p.AutoStart && !p.Preview {
+				auto = append(auto, n)
+			}
+		}
+		if len(auto) == 0 {
+			fmt.Println("autostart:     none (enable with `roxey projects --autostart <name>`)")
+		} else {
+			fmt.Printf("autostart:     %s\n", strings.Join(auto, ", "))
+		}
+		return nil
+	default:
+		return fmt.Errorf("unknown service command %q", args[0])
+	}
+}
+
 // ── projects ─────────────────────────────────────────────────────────────
 
 func cmdProjects(args []string) error {
 	forget, prune := "", false
+	var autostartName string
+	autostartOn := true
 	for i := 0; i < len(args); i++ {
 		switch {
 		case args[i] == "--prune":
@@ -981,6 +1193,18 @@ func cmdProjects(args []string) error {
 		case (args[i] == "--forget" || args[i] == "-f") && i+1 < len(args):
 			i++
 			forget = args[i]
+		case strings.HasPrefix(args[i], "--autostart="):
+			v := strings.TrimPrefix(args[i], "--autostart=")
+			if strings.HasPrefix(v, "off:") || v == "off" {
+				return fmt.Errorf("usage: roxey projects --autostart-off <name> | --autostart=<name>")
+			}
+			autostartName, autostartOn = v, true
+		case args[i] == "--autostart" && i+1 < len(args):
+			i++
+			autostartName, autostartOn = args[i], true
+		case args[i] == "--autostart-off" && i+1 < len(args):
+			i++
+			autostartName, autostartOn = args[i], false
 		default:
 			return fmt.Errorf("unexpected argument %q", args[i])
 		}
@@ -990,6 +1214,37 @@ func cmdProjects(args []string) error {
 	if err != nil {
 		return err
 	}
+
+	if autostartName != "" {
+		p, ok := reg.Get(autostartName)
+		if !ok {
+			return fmt.Errorf("unknown project %q", autostartName)
+		}
+		if p.Preview {
+			return fmt.Errorf("previews cannot be autostarted")
+		}
+		p.AutoStart = autostartOn
+		if err := reg.Save(); err != nil {
+			return err
+		}
+		mgr, err := service.NewManager()
+		if err != nil {
+			return err
+		}
+		if autostartOn {
+			if err := mgr.InstallProjectAgent(autostartName); err != nil {
+				return fmt.Errorf("install autostart agent: %w", err)
+			}
+			fmt.Printf("Autostart enabled for %s.\n", autostartName)
+		} else {
+			if err := mgr.UninstallProjectAgent(autostartName); err != nil {
+				return fmt.Errorf("remove autostart agent: %w", err)
+			}
+			fmt.Printf("Autostart disabled for %s.\n", autostartName)
+		}
+		return nil
+	}
+
 	if forget != "" {
 		if !reg.Forget(forget) {
 			return fmt.Errorf("unknown project %q", forget)

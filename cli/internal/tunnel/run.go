@@ -19,6 +19,7 @@ import (
 	"github.com/hashicorp/yamux"
 
 	"roxey/internal/config"
+	"roxey/internal/localrelay"
 )
 
 func pipe(a, b net.Conn) {
@@ -65,7 +66,7 @@ func handshakeReason(resp *http.Response) string {
 	return fmt.Sprintf(" (%s)", strings.TrimSpace(string(body)))
 }
 
-// Run connects to the relay for tld (at relay.<tld>) and blocks, bridging
+// Run connects to the relay for tld (at roxey.<tld>) and blocks, bridging
 // tunneled streams to the local target, until the connection drops or the
 // process is signaled.
 func Run(tld, service, pathPrefix, target string) error {
@@ -80,9 +81,9 @@ func Run(tld, service, pathPrefix, target string) error {
 	if os.Getenv("ROXEY_INSECURE") == "1" { // for testing against a relay without TLS
 		scheme = "ws"
 	}
-	relayHost := os.Getenv("ROXEY_RELAY_HOST") // overrides the relay.<tld> hostname (self-hosted/testing)
+	relayHost := os.Getenv("ROXEY_RELAY_HOST") // overrides the roxey.<tld> hostname (self-hosted/testing)
 	if relayHost == "" {
-		relayHost = "relay." + tld
+		relayHost = localrelay.AdminSubdomain + "." + tld
 	}
 	u := url.URL{Scheme: scheme, Host: relayHost, Path: "/_ws"}
 	q := u.Query()

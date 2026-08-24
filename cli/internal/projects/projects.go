@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"roxey/internal/config"
+	"roxey/internal/localrelay"
 )
 
 type Project struct {
@@ -23,7 +24,9 @@ type Project struct {
 	Hosts   []string `json:"hosts"` // environment hosts (without TLD)
 	Preview bool     `json:"preview,omitempty"`
 	Branch  string   `json:"branch,omitempty"`
-	AddedAt string   `json:"addedAt"`
+	// AutoStart brings the project up at login/boot (service install).
+	AutoStart bool   `json:"autoStart,omitempty"`
+	AddedAt   string `json:"addedAt"`
 }
 
 type Registry struct {
@@ -138,7 +141,7 @@ func (rg *Registry) SortedNames() []string {
 }
 
 // AllLocalHostFQDNs returns every hostname (host + "." + tld) claimed by any
-// project running against a local relay, plus relay.<tld> for each distinct
+// project running against a local relay, plus roxey.<tld> for each distinct
 // local TLD. Used for cumulative cert SANs and /etc/hosts entries.
 func (rg *Registry) AllLocalHostFQDNs() []string {
 	set := map[string]bool{}
@@ -146,7 +149,7 @@ func (rg *Registry) AllLocalHostFQDNs() []string {
 		if !p.Local {
 			continue
 		}
-		set["relay."+p.TLD] = true
+		set[localrelay.AdminSubdomain+"."+p.TLD] = true
 		for _, h := range p.Hosts {
 			set[h+"."+p.TLD] = true
 		}

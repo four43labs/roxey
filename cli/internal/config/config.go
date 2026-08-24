@@ -15,7 +15,7 @@ import (
 )
 
 // ServerConfig is one known relay server, keyed by its TLD. The relay is
-// always expected at relay.<tld> and public URLs are https://<host>.<tld>.
+// always expected at roxey.<tld> and public URLs are https://<host>.<tld>.
 type ServerConfig struct {
 	APIKey string `json:"apiKey,omitempty"`
 	Local  bool   `json:"local,omitempty"`
@@ -52,7 +52,17 @@ type ServiceInfo struct {
 	LogFile      string `json:"logFile"`
 }
 
+// dirOverride lets the boot-time service daemon target the real user's
+// state directory (daemons run with root's $HOME).
+var dirOverride string
+
+// SetDir overrides the state directory (used by `_service-relay`).
+func SetDir(d string) { dirOverride = d }
+
 func Dir() string {
+	if dirOverride != "" {
+		return dirOverride
+	}
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".roxey")
 }

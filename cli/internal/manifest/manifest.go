@@ -16,7 +16,7 @@ import (
 )
 
 // RelayServer selects the relay this manifest's tunnels attach to.
-// The relay is always expected at relay.<tld>; public URLs are
+// The relay is always expected at roxey.<tld>; public URLs are
 // https://<host>.<tld>.
 type RelayServer struct {
 	TLD    string `yaml:"tld"`
@@ -69,7 +69,7 @@ var hostTemplateRe = regexp.MustCompile(`\{\{\s*host:([a-z0-9.-]+)\s*\}\}`)
 var hostRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
 
 // DefaultLocalTLD is the TLD every project shares when using the local
-// relay: one relay at relay.<DefaultLocalTLD> serves all projects.
+// relay: one relay at roxey.<DefaultLocalTLD> serves all projects.
 const DefaultLocalTLD = "dev"
 
 // Load reads and validates the manifest at path.
