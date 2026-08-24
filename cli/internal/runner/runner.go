@@ -115,6 +115,16 @@ func SpawnForeground(opts SpawnOptions, writeFn func(line string)) (int, <-chan 
 	return pid, done, nil
 }
 
+// FreePort asks the kernel for an available TCP port (preview auto-ports).
+func FreePort() (int, error) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, err
+	}
+	defer l.Close()
+	return l.Addr().(*net.TCPAddr).Port, nil
+}
+
 func buildCmd(opts SpawnOptions, stdout, stderr *os.File) (*exec.Cmd, error) {
 	parts, err := splitCommand(opts.Command)
 	if err != nil {
@@ -233,4 +243,3 @@ func PruneDead(services map[string]config.ServiceInfo) map[string]config.Service
 	}
 	return out
 }
-

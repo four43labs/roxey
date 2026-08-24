@@ -21,6 +21,8 @@ import (
 	"roxey/internal/localca"
 	"roxey/internal/localrelay"
 	"roxey/internal/manifest"
+	"roxey/internal/preview"
+	"roxey/internal/projects"
 	"roxey/internal/runner"
 	"roxey/internal/tunnel"
 )
@@ -50,6 +52,8 @@ func main() {
 		err = cmdStop(os.Args[2:])
 	case "list":
 		err = cmdList()
+	case "projects":
+		err = cmdProjects(os.Args[2:])
 	case "up":
 		err = cmdUp(os.Args[2:])
 	case "down":
@@ -75,13 +79,18 @@ func usage() {
 
 Commands:
   auth [--tld <tld>] [api-key]        Save an API key for a relay server
-  up [-d] [roxey.yaml]                Bring up a manifest's environments
-  down [roxey.yaml]                   Tear down a manifest's tunnels + services
+  up [-d] [--preview[=slug]] [file]   Bring up a manifest's environments
+  down [file]                         Tear down a manifest's tunnels + services
+  projects [--forget n] [--prune]     List known projects and their status
   logs <name>                         Tail a service started by ` + "`up -d`" + `
   doctor [roxey.yaml]                 Diagnose state, relays, certs, and ports
   start <service>[/path/*] <target>   Ad-hoc tunnel, e.g. roxey start myapp localhost:3000
   stop <service>[/path]               Stop a running tunnel
-  list                                List tunnels running on this machine`)
+  list                                List tunnels running on this machine
+
+up/down/logs/doctor accept --project <name> to run against a registered
+project from any directory. Inside a linked git worktree (or with
+--preview[=slug]), up creates an isolated fork preview.`)
 }
 
 // ── auth ─────────────────────────────────────────────────────────────────
@@ -301,16 +310,51 @@ type runRoute struct {
 
 func cmdUp(args []string) error {
 	detach := false
+	previewFlag := false
+	var previewSlug string
 	var file string
-	for _, a := range args {
+	var project string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
 		switch {
 		case a == "-d" || a == "--detach":
 			detach = true
-		case file == "":
+		case a == "--preview":
+			previewFlag = true
+		case strings.HasPrefix(a, "--preview="):
+			previewFlag = true
+			previewSlug = strings.TrimPrefix(a, "--preview=")
+		case a == "--project" && i+1 < len(args):
+			i++
+			project = args[i]
+		case strings.HasPrefix(a, "--project="):
+			project = strings.TrimPrefix(a, "--project=")
+		case file == "" && !strings.HasPrefix(a, "-"):
 			file = a
 		default:
 			return fmt.Errorf("unexpected argument %q", a)
 		}
+	}
+
+	// --project resolves the manifest from the central registry.
+	if project != "" {
+		if file != "" {
+			return fmt.Errorf("use either --project or a manifest path, not both")
+		}
+		reg, err := projects.Load()
+		if err != nil {
+			return err
+		}
+		p, ok := reg.Get(project)
+		if !ok {
+			return fmt.Errorf("unknown project %q — see `roxey projects`", project)
+		}
+		file = filepath.Join(p.Path, "roxey.yaml")
+	}
+	if previewFlag && previewSlug != "" {
+		// explicit slug only makes sense from the manifest's own directory
+	} else if previewFlag && file == "" {
+		file = "roxey.yaml"
 	}
 	if file == "" {
 		file = "roxey.yaml"
@@ -319,6 +363,38 @@ func cmdUp(args []string) error {
 	if err != nil {
 		return err
 	}
+
+	m, err := manifest.Load(absFile)
+	if err != nil {
+		return err
+	}
+
+	// Preview identity: explicit flag wins; otherwise auto-detect worktrees.
+	projectName := filepath.Base(filepath.Dir(absFile))
+	branch := ""
+	isPreview := previewFlag
+	if previewFlag {
+		if previewSlug != "" {
+			branch = previewSlug
+			previewSlug = preview.Slugify(previewSlug)
+		} else if b, ok := preview.Detect(m.Dir); ok {
+			branch = b
+			previewSlug = preview.Slugify(b)
+		} else {
+			previewSlug = "local"
+			branch = "local"
+		}
+	} else if b, ok := preview.Detect(m.Dir); ok {
+		isPreview = true
+		branch = b
+		previewSlug = preview.Slugify(b)
+	}
+	if isPreview {
+		projectName = preview.Apply(m, projectName, previewSlug)
+	}
+	m.ResolveEnvTemplates()
+
+	absDir := m.Dir
 
 	// Crash guard: if anything below panics, tear down whatever this run
 	// already spawned before propagating.
@@ -330,16 +406,29 @@ func cmdUp(args []string) error {
 		}
 	}()
 
-	m, err := manifest.Load(absFile)
+	tld := m.RelayServer.TLD
+
+	// Collect declared hosts for the registry (post-preview-rewrite).
+	var envHosts []string
+	for _, e := range m.Environments {
+		envHosts = append(envHosts, e.Host)
+	}
+
+	// Auto-register / update this project in the central registry.
+	reg, err := projects.Load()
 	if err != nil {
 		return err
 	}
-	tld := m.RelayServer.TLD
+	registeredName, err := reg.Register(absDir, tld, m.RelayServer.Local, envHosts, branch, isPreview)
+	if err != nil {
+		return err
+	}
+	_ = registeredName
 
 	// Resolve the relay and API key.
 	apiKey := m.RelayServer.APIKey
 	if m.RelayServer.Local {
-		if err := ensureLocalRelay(m); err != nil {
+		if err := ensureLocalRelay(m, reg); err != nil {
 			return err
 		}
 	} else if apiKey == "" {
@@ -365,6 +454,13 @@ func cmdUp(args []string) error {
 		e := &m.Environments[ei]
 		for ri := range e.Routes {
 			r := &e.Routes[ri]
+			if r.IsRun() && r.Port == 0 { // preview/auto port: assign a free one
+				port, err := runner.FreePort()
+				if err != nil {
+					return fmt.Errorf("assign free port for %s%s: %w", e.Host, r.Path, err)
+				}
+				r.Port = port
+			}
 			rr := runRoute{name: e.Host + r.Path, env: e.Host, route: r}
 			if r.IsRun() {
 				runs = append(runs, rr)
@@ -548,19 +644,22 @@ func teardownManifest(manifestPath string) error {
 	return config.SaveServices(services)
 }
 
-// ensureLocalRelay provisions CA/trust/hosts and makes sure the local relay
-// is running with an API key saved.
-func ensureLocalRelay(m *manifest.Manifest) error {
+// ensureLocalRelay provisions CA/trust/hosts and makes sure the shared
+// local relay is running with an API key saved. Cert SANs and the
+// /etc/hosts block cover every registered local project (cumulative), so
+// bringing one project up never breaks another's URLs.
+func ensureLocalRelay(m *manifest.Manifest, reg *projects.Registry) error {
 	tld := m.RelayServer.TLD
 
-	var hosts []string
+	// Cumulative host set: everything registered + this manifest's hosts.
+	hosts := reg.AllLocalHostFQDNs()
 	for _, e := range m.Environments {
 		hosts = append(hosts, e.Host+"."+tld)
 	}
-	hosts = append(hosts, localrelay.RelayHost(tld))
 	if tld == "localhost" {
 		hosts = append(hosts, "localhost")
 	}
+	hosts = dedupe(hosts)
 
 	res, err := localca.Ensure(hosts)
 	if err != nil {
@@ -574,7 +673,7 @@ func ensureLocalRelay(m *manifest.Manifest) error {
 	}
 
 	if localrelay.NeedsHosts(tld) {
-		if err := localrelay.SyncHosts(localrelay.HostsEntries(tld, envHostsOf(m))); err != nil {
+		if err := localrelay.SyncHosts(hosts); err != nil {
 			return fmt.Errorf("/etc/hosts sync: %w", err)
 		}
 	}
@@ -599,25 +698,51 @@ func ensureLocalRelay(m *manifest.Manifest) error {
 	return nil
 }
 
-func envHostsOf(m *manifest.Manifest) []string {
-	out := make([]string, 0, len(m.Environments))
-	for _, e := range m.Environments {
-		out = append(out, e.Host)
+func dedupe(in []string) []string {
+	seen := map[string]bool{}
+	out := in[:0]
+	for _, s := range in {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
 	}
 	return out
 }
 
 func cmdDown(args []string) error {
 	var file string
-	for _, a := range args {
+	var project string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
 		if a == "-d" || a == "--detach" {
 			continue // tolerated for symmetry with up
 		}
-		if file == "" {
+		switch {
+		case strings.HasPrefix(a, "--project="):
+			project = strings.TrimPrefix(a, "--project=")
+		case a == "--project" && i+1 < len(args):
+			i++
+			project = args[i]
+		case file == "":
 			file = a
-		} else {
+		default:
 			return fmt.Errorf("unexpected argument %q", a)
 		}
+	}
+	if project != "" {
+		if file != "" {
+			return fmt.Errorf("use either --project or a manifest path, not both")
+		}
+		reg, err := projects.Load()
+		if err != nil {
+			return err
+		}
+		p, ok := reg.Get(project)
+		if !ok {
+			return fmt.Errorf("unknown project %q — see `roxey projects`", project)
+		}
+		file = filepath.Join(p.Path, "roxey.yaml")
 	}
 	if file == "" {
 		file = "roxey.yaml"
@@ -667,10 +792,20 @@ func cmdDown(args []string) error {
 		return err
 	}
 
-	// If no other live entries still use this TLD's hosts block, clean it.
-	if m.RelayServer.Local && localrelay.NeedsHosts(tld) && !anySurvivorOn(tunnels, services, tld) {
-		if err := localrelay.RemoveHosts(); err != nil {
-			fmt.Fprintln(os.Stderr, "warning: could not clean /etc/hosts:", err)
+	// Registry bookkeeping: forget this project, then re-sync the hosts
+	// block to whatever other projects still claim.
+	reg, err := projects.Load()
+	if err != nil {
+		return err
+	}
+	for _, p := range reg.Projects {
+		if projects.SameDir(p.Path, m.Dir) {
+			reg.Forget(p.Name) // covers previews too
+		}
+	}
+	if m.RelayServer.Local && localrelay.NeedsHosts(tld) {
+		if err := localrelay.SyncHosts(reg.AllLocalHostFQDNs()); err != nil {
+			fmt.Fprintln(os.Stderr, "warning: could not update /etc/hosts:", err)
 		}
 	}
 
@@ -705,13 +840,31 @@ func sameHost(key string, m *manifest.Manifest) bool {
 
 func cmdDoctor(args []string) error {
 	file := ""
-	for _, a := range args {
-		if strings.HasPrefix(a, "-") {
+	var project string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case strings.HasPrefix(a, "--project="):
+			project = strings.TrimPrefix(a, "--project=")
+		case a == "--project" && i+1 < len(args):
+			i++
+			project = args[i]
+		case strings.HasPrefix(a, "-"):
 			continue
-		}
-		if file == "" {
+		case file == "":
 			file = a
 		}
+	}
+	if project != "" {
+		reg, err := projects.Load()
+		if err != nil {
+			return err
+		}
+		p, ok := reg.Get(project)
+		if !ok {
+			return fmt.Errorf("unknown project %q — see `roxey projects`", project)
+		}
+		file = filepath.Join(p.Path, "roxey.yaml")
 	}
 
 	rep := &doctor.Report{}
@@ -815,6 +968,87 @@ func cmdDoctor(args []string) error {
 		return fmt.Errorf("doctor found %d failure(s)", fails)
 	}
 	return nil
+}
+
+// ── projects ─────────────────────────────────────────────────────────────
+
+func cmdProjects(args []string) error {
+	forget, prune := "", false
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == "--prune":
+			prune = true
+		case (args[i] == "--forget" || args[i] == "-f") && i+1 < len(args):
+			i++
+			forget = args[i]
+		default:
+			return fmt.Errorf("unexpected argument %q", args[i])
+		}
+	}
+
+	reg, err := projects.Load()
+	if err != nil {
+		return err
+	}
+	if forget != "" {
+		if !reg.Forget(forget) {
+			return fmt.Errorf("unknown project %q", forget)
+		}
+		fmt.Printf("Forgot %s.\n", forget)
+		return nil
+	}
+	if pruned := reg.Prune(); prune && len(pruned) > 0 {
+		fmt.Printf("Pruned %d project(s): %s\n", len(pruned), strings.Join(pruned, ", "))
+	}
+
+	tunnels, _ := config.LoadTunnels()
+	services, _ := config.LoadServices()
+
+	names := reg.SortedNames()
+	if len(names) == 0 {
+		fmt.Println("No known projects. Run `roxey up` inside a project to register it.")
+		return nil
+	}
+
+	fmt.Printf("%-28s %-9s %-6s %s\n", "NAME", "STATUS", "PREVIEW", "PATH")
+	for _, name := range names {
+		p := reg.Projects[name]
+		status, urls := projectStatus(p, tunnels, services)
+		tag := ""
+		if p.Preview {
+			tag = p.Branch
+		}
+		fmt.Printf("%-28s %-9s %-6s %s\n", name, status, tag, p.Path)
+		if urls > 0 {
+			_ = urls
+		}
+	}
+	return nil
+}
+
+// projectStatus derives running/stopped/partial from live processes.
+func projectStatus(p *projects.Project, tunnels map[string]config.TunnelInfo, services map[string]config.ServiceInfo) (string, int) {
+	live := 0
+	for _, t := range tunnels {
+		if projects.SameDir(filepath.Dir(t.ManifestPath), p.Path) && t.ManifestPath != "" && processAlive(t.PID) {
+			live++
+		}
+	}
+	svcLive := 0
+	for _, s := range services {
+		if projects.SameDir(s.ManifestPath, p.Path) && s.ManifestPath != "" && processAlive(s.PID) {
+			svcLive++
+		}
+	}
+	total := live + svcLive
+	switch {
+	case total > 0 && svcLive > 0 && live == 0:
+		return "services", total
+	case total > 0:
+		return "running", total
+	default:
+		return "stopped", 0
+	}
 }
 
 // ── logs ─────────────────────────────────────────────────────────────────

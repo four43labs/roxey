@@ -111,26 +111,79 @@ Skip the hosted relay entirely and run one on your own machine — portless-styl
 
 ```yaml
 relay_server:
-  local: true           # tld defaults to "localhost"...
-  # tld: dev.mycompany.dev   # ...but ANY domain works, not just .localhost
+  local: true           # tld defaults to "dev"...
+  # tld: mycompany.dev  # ...but ANY domain works
 ```
 
-On first `up`, roxey downloads the relay binary, generates a local CA, asks once for sudo to trust it and bind port 443, creates its own API key, and starts the relay. You then browse `https://shop.localhost` — no cert warnings, no manual setup.
+On first `up`, roxey downloads the relay binary, generates a local CA, asks once for sudo to trust it and bind port 443, creates its own API key, and starts the relay. You then browse your project's URLs with no cert warnings and no manual setup.
 
-**Any TLD works locally, not just `.localhost`.** With `tld: dev.mycompany.dev` you get `https://shop.dev.mycompany.dev` — URLs shaped exactly like production. Roxey syncs the needed names into `/etc/hosts` under a managed block (removed by `roxey down`) and covers them all with one wildcard-style certificate.
+**One relay serves all your projects.** The default TLD is `dev`, and every project namespaces its hosts under its own name:
+
+```yaml
+# verifycate/roxey.yaml                # zelion/roxey.yaml
+environments:                          environments:
+  - host: app.verifycate                 - host: shop.zelioncricket
+    ...                                    ...
+  - host: api.verifycate                 - host: api.zelioncricket
+```
+
+→ `https://app.verifycate.dev` and `https://shop.zelioncricket.dev` run simultaneously against the same `relay.dev`. Certificates and `/etc/hosts` entries are cumulative across projects; `down` removes only that project's names.
+
+Any explicit `tld:` is still honored (`tld: localhost` for native-resolving names, or a production-shaped domain like `dev.mycompany.dev`).
 
 #### When to use which
 
-- **`local: true` with `.localhost` (default)** — solo work and quick iteration. `.localhost` names resolve natively in Chrome/Firefox/Edge; zero DNS or privileges beyond a one-time sudo prompt.
-- **`local: true` with a custom TLD** — when you need production-shaped URLs: strict OAuth providers (Google, Apple) reject `.localhost` redirect URIs but accept real domains, and cross-subdomain cookies (`shop` ↔ `api` on one TLD) behave exactly as they will in prod.
-- **Hosted / self-hosted remote relay** — when teammates, devices on your LAN, or external webhooks must reach your dev environment.
+- **`local: true` (default `.dev`)** — everyday work. All projects share one relay; hosts are synced into `/etc/hosts` under a managed block.
+- **Hosted / self-hosted remote relay** — when teammates, LAN devices, or external webhooks must reach your dev environment.
 
 #### Tips for local dev
 
-- OAuth callbacks work as-is under a custom TLD: register `https://app.dev.mycompany.dev/api/auth/callback/google` once and it works across every branch.
-- Give each service its own subdomain (`api.*`, `admin.*`) rather than path prefixes when apps hard-code origins or cookies — everything still runs on your machine.
+- OAuth callbacks work as-is under a custom TLD: register the callback URL once and it works across every branch.
+- Give each service its own host (`api.*`, `admin.*`) rather than path prefixes when apps hard-code origins or cookies.
 - The relay keeps running after `roxey down` so subsequent `up`s are instant; stop it manually with `pkill roxey-relay`.
-- Everything binds to loopback only — nothing is reachable from other machines unless you also point a remote relay at them.
+
+### Multiple projects from anywhere
+
+The first `roxey up` in a project registers it in `~/.roxey/projects.json`. After that, every command works from any directory:
+
+```bash
+roxey projects                    # all known projects + live status
+roxey up --project verifycate     # bring up from anywhere
+roxey down --project verifycate   # tear down just that project
+roxey logs <service-name>         # tail a detached service
+roxey doctor --project verifycate # diagnose one project
+roxey projects --forget verifycate  # drop a project from the registry
+roxey projects --prune            # GC projects whose directories are gone
+```
+
+Status is always derived live — the registry stores only identity (name, path, claimed hosts), never state that can go stale.
+
+### Fork previews for git worktrees (AI-agent friendly)
+
+Run `roxey up` inside a linked git worktree and roxey automatically creates an *isolated preview*: environment hosts get the branch slug as prefix, services get fresh auto-assigned ports, and everything registers as its own project.
+
+```bash
+cd ~/projects/verifycate.worktrees/fix-13-auth   # a git worktree
+roxey up                                          # → https://fix-13-app-verifycate.dev
+                                                  # → https://fix-13-api-verifycate.dev
+
+roxey projects                                    # main + preview listed side by side
+roxey down                                        # tears down only this fork
+```
+
+You can also force a named preview from anywhere (e.g. by commit id): `roxey up --preview=abc1234`.
+
+To keep forks pointing at *their own* services instead of the main checkout's, reference sibling hosts with templates in route env vars:
+
+```yaml
+environment:
+  NEXT_PUBLIC_API_URL: https://{{host:api.verifycate}}/api/v1
+  # → resolves to https://fix-13-api-verifycate.dev/api/v1 in the fork,
+  #   https://api.verifycate.dev on the main checkout — same yaml file everywhere
+```
+
+Note: stateful dependencies stay shared — a preview talks to the same Postgres unless you give it its own.
+Everything binds to loopback only — nothing is reachable from other machines unless you also point a remote relay at them.
 
 ## Commands
 
@@ -138,18 +191,23 @@ On first `up`, roxey downloads the relay binary, generates a local CA, asks once
 roxey auth [--tld <tld>] [api-key]
   # Save an API key for a relay server (prompts if key omitted)
 
-roxey up [-d] [file]
+roxey up [-d] [--preview[=slug]] [--project <name>] [file]
   # Bring up every environment in a roxey.yaml manifest
-  #   -d, --detach   Run detached; print URL table instead of streaming logs
-  #   file           Manifest path; defaults to ./roxey.yaml
+  #   -d, --detach     Run detached; print URL table instead of streaming logs
+  #   --preview[=slug] Force fork-preview mode (auto-detected in git worktrees)
+  #   --project <name> Run a registered project from any directory
+  #   file             Manifest path; defaults to ./roxey.yaml
 
-roxey down [file]
+roxey down [--project <name>] [file]
   # Stop the tunnels and spawned services owned by a manifest
+
+roxey projects [--forget <name>] [--prune]
+  # List known projects with live status; forget/GC registry entries
 
 roxey logs <name>
   # Tail the log of a service started with `up -d`
 
-roxey doctor [roxey.yaml]
+roxey doctor [--project <name>] [roxey.yaml]
   # Diagnose state, relays, certs, and ports; exit 1 on any failure
 
 roxey start <service>[/path/*] <target>

@@ -57,9 +57,20 @@ type Manifest struct {
 	// Dir is the directory containing the manifest file; relative cwds
 	// resolve against it.
 	Dir string
+
+	// HostMap maps each environment's declared host to its effective host
+	// (identical unless a fork-preview rewrote them). Used to resolve
+	// {{host:X}} placeholders in route environment values.
+	HostMap map[string]string
 }
 
+var hostTemplateRe = regexp.MustCompile(`\{\{\s*host:([a-z0-9.-]+)\s*\}\}`)
+
 var hostRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
+
+// DefaultLocalTLD is the TLD every project shares when using the local
+// relay: one relay at relay.<DefaultLocalTLD> serves all projects.
+const DefaultLocalTLD = "dev"
 
 // Load reads and validates the manifest at path.
 func Load(path string) (*Manifest, error) {
@@ -75,7 +86,43 @@ func Load(path string) (*Manifest, error) {
 	if err := m.Validate(); err != nil {
 		return nil, err
 	}
+	m.initHostMap()
 	return &m, nil
+}
+
+func (m *Manifest) initHostMap() {
+	if m.HostMap == nil {
+		m.HostMap = map[string]string{}
+	}
+	for _, e := range m.Environments {
+		if _, ok := m.HostMap[e.Host]; !ok {
+			m.HostMap[e.Host] = e.Host
+		}
+	}
+}
+
+// ResolveEnvTemplates replaces {{host:X}} placeholders in every route's
+// environment values with the effective public host of environment X
+// (FQDN, without scheme). Unknown hosts resolve to themselves.
+func (m *Manifest) ResolveEnvTemplates() {
+	sub := func(match []byte) []byte {
+		name := string(hostTemplateRe.FindSubmatch(match)[1])
+		host := name
+		if final, ok := m.HostMap[name]; ok {
+			host = final
+		}
+		return []byte(host + "." + m.RelayServer.TLD)
+	}
+	for i := range m.Environments {
+		env := &m.Environments[i]
+		for j := range env.Routes {
+			for k, v := range env.Routes[j].Environment {
+				if hostTemplateRe.Match([]byte(v)) {
+					env.Routes[j].Environment[k] = string(hostTemplateRe.ReplaceAllFunc([]byte(v), sub))
+				}
+			}
+		}
+	}
 }
 
 func (m *Manifest) Validate() error {
@@ -84,7 +131,7 @@ func (m *Manifest) Validate() error {
 		return fmt.Errorf("relay_server is required (e.g. `relay_server:\\n  tld: f43.run` or `local: true`)")
 	}
 	if rs.TLD == "" && rs.Local {
-		rs.TLD = "localhost"
+		rs.TLD = DefaultLocalTLD
 	}
 	if rs.TLD == "" {
 		return fmt.Errorf("relay_server.tld is required")
@@ -103,8 +150,9 @@ func (m *Manifest) Validate() error {
 	for i := range m.Environments {
 		env := &m.Environments[i]
 		label := "environments[" + itoa(i) + "]"
-		if env.Host == "" || !hostRe.MatchString(env.Host) {
-			return fmt.Errorf("%s.host %q must be a DNS label", label, env.Host)
+		if env.Host == "" || !validHost(env.Host) {
+			return fmt.Errorf("%s.host %q must be a DNS name (labels like %q or dotted like %q)",
+				label, env.Host, "app", "app.verifycate")
 		}
 		if seenHosts[env.Host] {
 			return fmt.Errorf("%s.host %q is duplicated", label, env.Host)
@@ -130,9 +178,10 @@ func (m *Manifest) Validate() error {
 				if r.Target != "" {
 					return fmt.Errorf("%s sets both an address and command", rl)
 				}
-				if r.Port <= 0 || r.Port > 65535 {
-					return fmt.Errorf("%s.command %q requires a valid port field (1-65535)", rl, r.Command)
+				if r.Port < 0 || r.Port > 65535 {
+					return fmt.Errorf("%s.command %q has invalid port (%d)", rl, r.Command, r.Port)
 				}
+				// port 0 = roxey assigns a free one and exports PORT to the child
 				if r.Cwd != "" {
 					if !filepath.IsAbs(r.Cwd) {
 						r.Cwd = filepath.Join(m.Dir, r.Cwd)
@@ -162,6 +211,21 @@ func validTLD(tld string) bool {
 		}
 	}
 	return net.ParseIP(tld) == nil // bare IPs are not TLDs
+}
+
+// validHost accepts single labels ("app") and dotted multi-label names
+// ("app.verifycate"); every label must be a valid DNS word.
+func validHost(host string) bool {
+	host = strings.TrimSuffix(host, ".")
+	if host == "" || net.ParseIP(host) != nil {
+		return false
+	}
+	for _, l := range strings.Split(host, ".") {
+		if !hostRe.MatchString(l) {
+			return false
+		}
+	}
+	return true
 }
 
 // PublicURL returns the URL root for an environment host.

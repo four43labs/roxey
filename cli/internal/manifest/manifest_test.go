@@ -61,7 +61,7 @@ environments:
 	}
 }
 
-func TestLocalDefaultsToLocahostTLD(t *testing.T) {
+func TestLocalDefaultsToDevTLD(t *testing.T) {
 	m, err := Load(write(t, `
 relay_server:
   local: true
@@ -73,8 +73,78 @@ environments:
 	if err != nil {
 		t.Fatal(err)
 	}
+	if m.RelayServer.TLD != DefaultLocalTLD {
+		t.Fatalf("expected %q default, got %q", DefaultLocalTLD, m.RelayServer.TLD)
+	}
+}
+
+func TestExplicitLocalhostTLDStillHonored(t *testing.T) {
+	m, err := Load(write(t, `
+relay_server:
+  local: true
+  tld: localhost
+environments:
+  - host: app
+    routes:
+      "/": localhost:8080
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if m.RelayServer.TLD != "localhost" {
-		t.Fatalf("expected localhost default, got %q", m.RelayServer.TLD)
+		t.Fatalf("expected localhost, got %q", m.RelayServer.TLD)
+	}
+}
+
+func TestMultiLabelHostsAccepted(t *testing.T) {
+	m, err := Load(write(t, `
+relay_server: {tld: dev}
+environments:
+  - host: app.verifycate
+    routes:
+      "/": localhost:3000
+  - host: api.verifycate
+    routes:
+      "/api": localhost:8000
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m.Environments) != 2 || m.Environments[1].Host != "api.verifycate" {
+		t.Fatalf("multi-label hosts not preserved: %+v", m.Environments)
+	}
+	if url := m.PublicURL("app.verifycate"); url != "https://app.verifycate.dev" {
+		t.Fatalf("bad URL: %q", url)
+	}
+}
+
+func TestRunRoutePortOptionalAndAutoAssigned(t *testing.T) {
+	m, err := Load(write(t, `
+relay_server: {tld: dev}
+environments:
+  - host: a
+    routes:
+      "/web":
+        command: pnpm dev
+        port: -3
+`))
+	if err == nil {
+		t.Fatal("expected invalid port error")
+	}
+
+	m, err = Load(write(t, `
+relay_server: {tld: dev}
+environments:
+  - host: a
+    routes:
+      "/web":
+        command: pnpm dev
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := m.Environments[0].Routes[0].Port; got != 0 {
+		t.Fatalf("expected port 0 (=auto), got %d", got)
 	}
 }
 
@@ -109,20 +179,6 @@ environments:
 	// either way it must fail
 	if err == nil {
 		t.Fatal("expected duplicate host/path error")
-	}
-}
-
-func TestRunRouteRequiresPort(t *testing.T) {
-	_, err := Load(write(t, `
-relay_server: {tld: f43.run}
-environments:
-  - host: a
-    routes:
-      "/web":
-        command: npm run dev
-`))
-	if err == nil || !contains(err.Error(), "port") {
-		t.Fatalf("expected port requirement error, got %v", err)
 	}
 }
 

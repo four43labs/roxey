@@ -102,6 +102,39 @@ check "tunnels torn down" "! curl -sf -H 'Host: app.smoke.localhost' http://127.
 check "spawned service killed" "! lsof -i :20001 -sTCP:LISTEN >/dev/null 2>&1"
 check "state cleaned" "! \"$CLI\" list | grep -q smoke.localhost"
 
+echo "== multi-project: registry + shared relay =="
+mkdir -p "$WORK/projA" "$WORK/projB"
+cat > "$WORK/projA/roxey.yaml" <<EOF
+relay_server: {tld: smoke.localhost}
+environments:
+  - host: app.proja
+    routes:
+      "/": localhost:19999
+EOF
+cat > "$WORK/projB/roxey.yaml" <<EOF
+relay_server: {tld: smoke.localhost}
+environments:
+  - host: app.projb
+    routes:
+      "/spawned":
+        command: python3 -m http.server 20002 --directory $WORK/appdir
+        port: 20002
+EOF
+
+"$CLI" up -d "$WORK/projA/roxey.yaml" >/dev/null
+"$CLI" up -d "$WORK/projB/roxey.yaml" >/dev/null
+sleep 1
+check "project A live"   "curl -sf -H 'Host: app.proja.smoke.localhost' http://127.0.0.1:18080/ | grep -q 'Directory listing'"
+check "project B live"   "curl -sf -H 'Host: app.projb.smoke.localhost' http://127.0.0.1:18080/spawned | grep -q 'spawned-service-content'"
+check "registry has both" "\"$CLI\" projects | grep -c proj | grep -q 2"
+"$CLI" down --project projA >/dev/null
+sleep 0.7
+check "down --project kills A only" "! curl -sf -H 'Host: app.proja.smoke.localhost' http://127.0.0.1:18080/ >/dev/null"
+check "B survives A's down" "curl -sf -H 'Host: app.projb.smoke.localhost' http://127.0.0.1:18080/spawned | grep -q 'spawned-service-content'"
+"$CLI" down --project projB >/dev/null
+sleep 0.5
+check "registry emptied by downs" "! \"$CLI\" projects | grep -qE '^proj'"
+
 echo
 echo "passed=$PASS failed=$FAIL  (workdir $WORK)"
 [ "$FAIL" = 0 ]
