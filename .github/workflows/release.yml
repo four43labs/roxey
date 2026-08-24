@@ -63,6 +63,13 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # Artifacts keep their cli/ backend/ subdirectories when merged;
+      # flatten so the release globs pick up every tarball.
+      - name: Flatten artifact layout
+        run: |
+          mkdir -p dist
+          find dist -type f -name '*.tar.gz' -exec mv -f {} dist/ \;
+
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*.tar.gz
