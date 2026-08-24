@@ -315,6 +315,16 @@ func cmdUp(args []string) error {
 		return err
 	}
 
+	// Crash guard: if anything below panics, tear down whatever this run
+	// already spawned before propagating.
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintln(os.Stderr, "[roxey] panic — stopping services and tunnels started by this run")
+			_ = teardownManifest(absFile)
+			panic(r)
+		}
+	}()
+
 	m, err := manifest.Load(absFile)
 	if err != nil {
 		return err
@@ -363,17 +373,38 @@ func cmdUp(args []string) error {
 	if err != nil {
 		return err
 	}
+
+	// Restart semantics: anything this manifest left running from a
+	// previous (possibly crashed) run is stopped first, then brought up
+	// fresh. This keeps `roxey up` deterministic and orphans impossible.
 	services = runner.PruneDead(services)
+	for k, svc := range services {
+		if svc.ManifestPath != absFile {
+			continue
+		}
+		if processAlive(svc.PID) {
+			runner.KillGroup(svc.PID)
+			fmt.Printf("[service] restarted %-18s (was pid %d)\n", svc.Name, svc.PID)
+		}
+		delete(services, k)
+	}
+	tunnels, err := config.LoadTunnels()
+	if err != nil {
+		return err
+	}
+	for k, info := range tunnels {
+		if info.ManifestPath == absFile && processAlive(info.PID) {
+			stopKey(tunnels, k)
+		}
+	}
+	if err := config.SaveTunnels(tunnels); err != nil {
+		return err
+	}
 
 	childDone := make(map[string]<-chan struct{})
 
 	startService := func(rr runRoute) error {
 		r := rr.route
-		// Idempotent: skip services already running for this manifest.
-		if existing, ok := services[svcKey(absFile, rr.name)]; ok && processAlive(existing.PID) {
-			fmt.Printf("[service] %-24s already running (pid %d)\n", rr.name, existing.PID)
-			return nil
-		}
 		logPath := filepath.Join(config.LogDir(), sanitizeName(rr.name)+".log")
 		opts := runner.SpawnOptions{
 			Name: rr.name, Cwd: r.Cwd, Command: r.Command, Port: r.Port,
@@ -416,10 +447,6 @@ func cmdUp(args []string) error {
 	}
 
 	// Open tunnels for every route.
-	tunnels, err := config.LoadTunnels()
-	if err != nil {
-		return err
-	}
 	for _, rr := range append(append([]runRoute{}, runs...), proxyRoutes...) {
 		r := rr.route
 		target := r.Target
@@ -427,10 +454,6 @@ func cmdUp(args []string) error {
 			target = fmt.Sprintf("localhost:%d", r.Port)
 		}
 		pathPrefix := strings.TrimSuffix(r.Path, "/") // "/" (root) registers as ""
-		key := tunnelKey(rr.env, pathPrefix)
-		if existing, ok := tunnels[key]; ok && processAlive(existing.PID) {
-			continue // idempotent re-up
-		}
 		if err := startOne(tld, rr.env, pathPrefix, target, absFile); err != nil {
 			return err
 		}

@@ -100,7 +100,10 @@ roxey up -d   # detached: prints a URL table, logs via `roxey logs <name>`
 roxey down    # stop this manifest's tunnels and spawned services
 ```
 
-Spawned services receive `PORT`, `HOST=127.0.0.1`, and their `environment` map. `up` waits until each port accepts connections before opening its tunnel, and re-running `up` skips anything already alive.
+Spawned services receive `PORT`, `HOST=127.0.0.1`, and their `environment`
+map. `up` waits until each port accepts connections before opening its
+tunnel, and re-running it restarts the manifest's services and tunnels from
+a clean slate — a crashed run can never leave orphans behind.
 
 ### Local development domains: `local` relay mode
 

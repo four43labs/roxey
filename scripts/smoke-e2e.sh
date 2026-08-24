@@ -85,9 +85,11 @@ check "root route proxied"     "curl -sf -H 'Host: app.smoke.localhost' http://1
 check "run-route spawned+up"   "curl -sf -H 'Host: app.smoke.localhost' http://127.0.0.1:18080/spawned | grep -q 'spawned-service-content'"
 check "service recorded"       "\"$CLI\" list | grep -q '\[service\]'"
 
-echo "== re-up is idempotent =="
+echo "== re-up restarts cleanly =="
 OUT=$("$CLI" up -d "$WORK/roxey.yaml" 2>&1)
-check "re-up skips live state" "echo \"\$OUT\" | grep -q 'already running'"
+check "re-up restarts services" "echo \"\$OUT\" | grep -q 'restarted'"
+sleep 1
+check "routes live after re-up"  "curl -sf -H 'Host: app.smoke.localhost' http://127.0.0.1:18080/spawned | grep -q 'spawned-service-content'"
 
 echo "== relay-side conflict surfaced =="
 OUT=$("$CLI" _run smoke.localhost app "" localhost:19999 2>&1 || true)
