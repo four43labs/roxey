@@ -4,108 +4,164 @@
 <meta charset="utf-8">
 <title>Roxey</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/common.css">
 <style>
-  :root { color-scheme: light dark; }
-  body { font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; max-width: 900px; margin: 40px auto; padding: 0 20px; }
-  h1 { font-size: 20px; }
-  h2 { font-size: 15px; margin-top: 40px; color: #888; text-transform: uppercase; letter-spacing: .04em; }
-  table { width: 100%; border-collapse: collapse; margin-top: 12px; }
-  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid #8883; font-size: 13px; }
-  th { color: #888; font-weight: 600; }
-  code { background: #8882; padding: 1px 5px; border-radius: 4px; }
-  button { font: inherit; padding: 6px 12px; border: 1px solid #8886; border-radius: 6px; background: transparent; cursor: pointer; }
-  button:hover { background: #8882; }
-  .empty { color: #888; padding: 16px 0; }
-  .key-banner { background: #ffd43b33; border: 1px solid #ffd43b88; border-radius: 8px; padding: 12px; margin-top: 12px; word-break: break-all; }
-  .danger { color: #e03131; border-color: #e0313166; }
+  .key-banner {
+    border: 1px solid #f2b63288; background: #f2b63214;
+    padding: 14px 16px; margin-top: 12px;
+  }
+  .key-banner .shell { word-break: break-all; margin: 6px 0 0; }
+  .key-banner .shell::before { content: "$ "; color: var(--dim); }
+  .copy-btn { color: var(--dim); font-size: 12px; }
+  .copy-btn:hover { color: var(--bg); background: var(--dim); }
 </style>
 </head>
 <body>
-<h1>Roxey</h1>
 
-<h2>Active tunnels</h2>
+<div class="topbar">
+  <h1 class="wordmark">roxey<span class="cursor">&#9608;</span></h1>
+  <span><span class="dim" id="who"></span> &nbsp;<button id="logout">[ log out ]</button></span>
+</div>
+
+<h2 class="section">Tunnels &mdash; active</h2>
 <table id="tunnels-table">
-  <thead><tr><th>Service</th><th>Path</th><th>Connected</th><th>Remote</th></tr></thead>
+  <thead><tr><th>Host</th><th>Path</th><th>Connected</th><th>Remote</th></tr></thead>
   <tbody></tbody>
 </table>
-<div id="tunnels-empty" class="empty" hidden>No active tunnels.</div>
+<div id="tunnels-empty" class="empty" hidden>no active tunnels &mdash; run <code>roxey up</code></div>
 
-<h2>Recent tunnels</h2>
+<h2 class="section">Tunnels &mdash; recent</h2>
 <table id="events-table">
-  <thead><tr><th>Service</th><th>Path</th><th>Remote</th><th>Connected</th><th>Disconnected</th></tr></thead>
+  <thead><tr><th>Host</th><th>Path</th><th>Connected</th><th>Disconnected</th></tr></thead>
   <tbody></tbody>
 </table>
-<div id="events-empty" class="empty" hidden>No tunnel history yet.</div>
+<div id="events-empty" class="empty" hidden>no tunnel history yet</div>
 
-<h2>API keys</h2>
-<button id="new-key">Generate new key</button>
-<div id="key-banner" class="key-banner" hidden></div>
+<h2 class="section">API keys</h2>
+<button id="new-key">[ generate new key ]</button>
+<div id="key-banner" class="key-banner" hidden>
+  <span class="amber">new key &mdash; shown once, store it now</span>
+  <p class="shell"><code id="new-key-value"></code> <button class="copy-btn" data-copy>[ copy ]</button></p>
+</div>
 <table id="keys-table">
   <thead><tr><th>Label</th><th>Created</th><th>Last used</th><th></th></tr></thead>
   <tbody></tbody>
 </table>
+<div id="keys-empty" class="empty" hidden>no keys yet &mdash; generate one above</div>
+
+<p class="footer">ROXEY RELAY &mdash; tunnels for humans</p>
 
 <script>
 async function api(path, opts) {
   const res = await fetch(path, opts);
-  if (!res.ok) throw new Error(await res.text());
+  if (res.status === 401) { location.href = '/login'; throw new Error('unauthorized'); }
+  if (!res.ok) throw new Error((await res.text()) || res.statusText);
   return res.status === 204 ? null : res.json();
 }
 
-function fmt(iso) { return iso ? new Date(iso).toLocaleString() : '–'; }
+function fmt(iso) { return iso ? new Date(iso).toLocaleString() : '\u2013'; }
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
 
+// ── me / logout ──
+api('/api/me').then(me => {
+  document.getElementById('who').textContent = me.email;
+}).catch(() => {});
+document.getElementById('logout').addEventListener('click', async () => {
+  await fetch('/api/auth/logout', { method: 'POST' });
+  location.href = '/login';
+});
+
+// ── tunnels ──
 async function loadTunnels() {
-  const rows = await api('/api/tunnels');
-  const tbody = document.querySelector('#tunnels-table tbody');
-  tbody.innerHTML = '';
-  document.getElementById('tunnels-empty').hidden = rows.length > 0;
-  for (const t of rows) {
-    const tr = document.createElement('tr');
-    tr.innerHTML = `<td><code>${t.service}</code></td><td>${t.path}</td><td>${fmt(t.connectedAt)}</td><td>${t.remote}</td>`;
-    tbody.appendChild(tr);
-  }
+  try {
+    const rows = await api('/api/tunnels');
+    const tbody = document.querySelector('#tunnels-table tbody');
+    tbody.innerHTML = '';
+    document.getElementById('tunnels-empty').hidden = rows.length > 0;
+    for (const t of rows) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td><a href="https://${esc(t.host)}${esc(t.path === '/' ? '' : t.path)}" target="_blank">${esc(t.host)}</a>`
+        + (t.protected ? ' <span class="tag-locked">[locked]</span>' : '') + `</td>`
+        + `<td>${esc(t.path)}</td><td>${fmt(t.connectedAt)}</td><td class="dim">${esc(t.remote)}</td>`;
+      tbody.appendChild(tr);
+    }
+  } catch {}
 }
 
 async function loadEvents() {
-  const rows = await api('/api/tunnel-events');
-  const tbody = document.querySelector('#events-table tbody');
-  tbody.innerHTML = '';
-  document.getElementById('events-empty').hidden = rows.length > 0;
-  for (const e of rows) {
-    const tr = document.createElement('tr');
-    const status = e.disconnectedAt ? fmt(e.disconnectedAt) : '<em>still connected</em>';
-    tr.innerHTML = `<td><code>${e.service}</code></td><td>${e.path}</td><td>${e.remote}</td><td>${fmt(e.connectedAt)}</td><td>${status}</td>`;
-    tbody.appendChild(tr);
-  }
+  try {
+    const rows = await api('/api/tunnel-events');
+    const tbody = document.querySelector('#events-table tbody');
+    tbody.innerHTML = '';
+    document.getElementById('events-empty').hidden = rows.length > 0;
+    for (const e of rows) {
+      const tr = document.createElement('tr');
+      const status = e.disconnectedAt ? fmt(e.disconnectedAt) : '<em>still connected</em>';
+      tr.innerHTML = `<td>${esc(e.host)}</td><td>${esc(e.path)}</td><td>${fmt(e.connectedAt)}</td><td>${status}</td>`;
+      tbody.appendChild(tr);
+    }
+  } catch {}
 }
 
+// ── keys ──
 async function loadKeys() {
-  const rows = await api('/api/keys');
-  const tbody = document.querySelector('#keys-table tbody');
-  tbody.innerHTML = '';
-  for (const k of rows) {
-    const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${k.label}</td><td>${fmt(k.createdAt)}</td><td>${fmt(k.lastUsedAt)}</td>
-      <td><button class="danger" data-id="${k.id}">Revoke</button></td>`;
-    tr.querySelector('button').addEventListener('click', async () => {
-      await api('/api/keys/' + k.id, { method: 'DELETE' });
-      loadKeys();
-    });
-    tbody.appendChild(tr);
-  }
+  try {
+    const rows = await api('/api/keys');
+    const tbody = document.querySelector('#keys-table tbody');
+    tbody.innerHTML = '';
+    document.getElementById('keys-empty').hidden = rows.length > 0;
+    for (const k of rows) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${esc(k.label)}</td><td class="dim">${fmt(k.createdAt)}</td><td class="dim">${fmt(k.lastUsedAt)}</td><td></td>`;
+      const cell = tr.lastElementChild;
+      const revoke = document.createElement('button');
+      revoke.className = 'danger';
+      revoke.textContent = '[ revoke ]';
+      revoke.addEventListener('click', () => confirmRevoke(cell, k.id));
+      cell.appendChild(revoke);
+      tbody.appendChild(tr);
+    }
+  } catch {}
+}
+
+function confirmRevoke(cell, id) {
+  cell.innerHTML = '';
+  const yes = document.createElement('button');
+  yes.className = 'danger';
+  yes.textContent = '[y] revoke';
+  const no = document.createElement('button');
+  no.textContent = ' [n] keep';
+  no.addEventListener('click', loadKeys);
+  yes.addEventListener('click', async () => {
+    await api('/api/keys/' + id, { method: 'DELETE' });
+    loadKeys();
+  });
+  cell.append(yes, no);
 }
 
 document.getElementById('new-key').addEventListener('click', async () => {
   const label = prompt('Label for this key (e.g. laptop, vps-1):') || '';
-  const created = await api('/api/keys', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ label }),
-  });
-  const banner = document.getElementById('key-banner');
-  banner.hidden = false;
-  banner.innerHTML = `New key (shown once) &mdash; run <code>roxey auth ${created.apiKey}</code>:<br><code>${created.apiKey}</code>`;
-  loadKeys();
+  try {
+    const created = await api('/api/keys', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ label }),
+    });
+    document.getElementById('key-banner').hidden = false;
+    document.getElementById('new-key-value').textContent = created.apiKey;
+    loadKeys();
+  } catch (e) {
+    alert('could not create key: ' + e.message);
+  }
+});
+
+document.querySelector('[data-copy]').addEventListener('click', async (e) => {
+  await navigator.clipboard.writeText(document.getElementById('new-key-value').textContent);
+  e.target.textContent = '[ copied ]';
+  setTimeout(() => { e.target.textContent = '[ copy ]'; }, 1500);
 });
 
 loadTunnels();

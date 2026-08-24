@@ -7,3 +7,6 @@ backend/roxey.db
 backend/.env
 
 .DS_Store
+
+# Tooling artifacts
+.playwright-mcp/

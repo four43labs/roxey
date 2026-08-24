@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Create account — roxey</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/common.css">
+<style>
+  .panel { max-width: 380px; margin: 18vh auto 0; }
+  .sub { color: var(--dim); font-size: 12px; margin: 0 0 8px; }
+</style>
+</head>
+<body>
+<main class="panel panel-box">
+  <h1 class="wordmark">roxey<span class="cursor">&#9608;</span></h1>
+  <p class="sub">create an account &mdash; you'll generate your first API key after signing in</p>
+
+  <form id="form">
+    <label for="email">Email</label>
+    <input id="email" name="email" type="email" autocomplete="email" autofocus required>
+    <label for="password">Password <span class="dim">(min 8 chars)</span></label>
+    <input id="password" name="password" type="password" autocomplete="new-password" minlength="8" required>
+    <label for="confirm">Confirm password</label>
+    <input id="confirm" name="confirm" type="password" autocomplete="new-password" minlength="8" required>
+    <button type="submit" class="btn-solid">[ create account ]</button>
+    <p class="error-line" id="error"></p>
+  </form>
+
+  <p class="dim">have an account? <a href="/login">sign in</a></p>
+</main>
+
+<script>
+document.getElementById('form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const err = document.getElementById('error');
+  err.textContent = '';
+  const password = document.getElementById('password').value;
+  if (password !== document.getElementById('confirm').value) {
+    err.textContent = 'passwords do not match';
+    return;
+  }
+  try {
+    const res = await fetch('/api/auth/signup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email: document.getElementById('email').value,
+        password,
+      }),
+    });
+    if (res.ok) {
+      location.href = '/';
+      return;
+    }
+    err.textContent = await res.text();
+  } catch {
+    err.textContent = 'network error';
+  }
+});
+</script>
+</body>
+</html>

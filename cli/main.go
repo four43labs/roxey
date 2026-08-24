@@ -24,6 +24,7 @@ import (
 	"roxey/internal/manifest"
 	"roxey/internal/preview"
 	"roxey/internal/projects"
+	"roxey/internal/relayapi"
 	"roxey/internal/runner"
 	"roxey/internal/service"
 	"roxey/internal/tunnel"
@@ -92,6 +93,7 @@ Commands:
   logs <name>                         Tail a service started by ` + "`up -d`" + `
   doctor [roxey.yaml]                 Diagnose state, relays, certs, and ports
   start <service>[/path/*] <target>   Ad-hoc tunnel, e.g. roxey start myapp localhost:3000
+                                      add --protect <secret> to require a password
   stop <service>[/path]               Stop a running tunnel
   list                                List tunnels running on this machine
 
@@ -164,7 +166,7 @@ func processAlive(pid int) bool {
 }
 
 // startOne spawns the detached tunnel worker for one route and records it.
-func startOne(tld, service, pathPrefix, target, manifestPath string) error {
+func startOne(tld, service, pathPrefix, target, protect, manifestPath string) error {
 	key := tunnelKey(service, pathPrefix)
 
 	tunnels, err := config.LoadTunnels()
@@ -189,7 +191,11 @@ func startOne(tld, service, pathPrefix, target, manifestPath string) error {
 	}
 	defer logFile.Close()
 
-	proc := exec.Command(self, "_run", tld, service, pathPrefix, target)
+	runArgs := []string{"_run", tld, service, pathPrefix, target}
+	if protect != "" {
+		runArgs = append(runArgs, protect)
+	}
+	proc := exec.Command(self, runArgs...)
 	proc.Stdout = logFile
 	proc.Stderr = logFile
 	proc.SysProcAttr = &syscall.SysProcAttr{Setsid: true} // detach from this terminal/session
@@ -208,10 +214,24 @@ func startOne(tld, service, pathPrefix, target, manifestPath string) error {
 }
 
 func cmdStart(args []string) error {
-	if len(args) < 2 {
-		return fmt.Errorf("usage: roxey start <service-name>[/path/*] <localhost:port>")
+	var rest []string
+	protect := ""
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--protect" && i+1 < len(args) {
+			i++
+			protect = args[i]
+			continue
+		}
+		if strings.HasPrefix(args[i], "--protect=") {
+			protect = strings.TrimPrefix(args[i], "--protect=")
+			continue
+		}
+		rest = append(rest, args[i])
 	}
-	spec, target := args[0], args[1]
+	if len(rest) < 2 {
+		return fmt.Errorf("usage: roxey start <service-name>[/path/*] <localhost:port> [--protect <secret>]")
+	}
+	spec, target := rest[0], rest[1]
 	tld := defaultTLD()
 
 	sc, ok := config.ServerFor(tld)
@@ -220,7 +240,7 @@ func cmdStart(args []string) error {
 	}
 
 	service, pathPrefix := parseServiceSpec(spec)
-	if err := startOne(tld, service, pathPrefix, target, ""); err != nil {
+	if err := startOne(tld, service, pathPrefix, target, protect, ""); err != nil {
 		return err
 	}
 	fmt.Printf("Tunnel started: https://%s.%s%s -> %s\n", service, tld, pathPrefix, target)
@@ -302,17 +322,22 @@ func cmdList() error {
 
 func cmdRun(args []string) error {
 	if len(args) < 4 {
-		return fmt.Errorf("usage: roxey _run <tld> <service> <pathPrefix> <target>")
+		return fmt.Errorf("usage: roxey _run <tld> <service> <pathPrefix> <target> [protect]")
 	}
-	return tunnel.Run(args[0], args[1], args[2], args[3])
+	protect := ""
+	if len(args) > 4 {
+		protect = args[4]
+	}
+	return tunnel.Run(args[0], args[1], args[2], args[3], protect)
 }
 
 // ── up / down ────────────────────────────────────────────────────────────
 
 type runRoute struct {
-	name  string // env host + path, unique within manifest
-	env   string // environment host label
-	route *manifest.Route
+	name    string // env host + path, unique within manifest
+	env     string // environment host label
+	protect string // shared secret gating the environment, if any
+	route   *manifest.Route
 }
 
 func cmdUp(args []string) error {
@@ -468,7 +493,7 @@ func cmdUp(args []string) error {
 				}
 				r.Port = port
 			}
-			rr := runRoute{name: e.Host + r.Path, env: e.Host, route: r}
+			rr := runRoute{name: e.Host + r.Path, env: e.Host, protect: e.Protect, route: r}
 			if r.IsRun() {
 				runs = append(runs, rr)
 			} else {
@@ -562,14 +587,30 @@ func cmdUp(args []string) error {
 			target = fmt.Sprintf("localhost:%d", r.Port)
 		}
 		pathPrefix := strings.TrimSuffix(r.Path, "/") // "/" (root) registers as ""
-		if err := startOne(tld, rr.env, pathPrefix, target, absFile); err != nil {
+		if err := startOne(tld, rr.env, pathPrefix, target, rr.protect, absFile); err != nil {
 			return err
 		}
 	}
 
 	fmt.Println()
+	// Hosted relays namespace every service per account+service; ask the
+	// relay for the real hosts so the printed URLs are authoritative.
+	displayHosts := map[string]string{}
+	if !m.RelayServer.Local && apiKey != "" {
+		services := make([]string, 0, len(m.Environments))
+		for _, e := range m.Environments {
+			services = append(services, e.Host)
+		}
+		if h, err := relayapi.LookupHosts(tld, apiKey, services); err == nil {
+			displayHosts = h
+		}
+	}
 	for _, e := range m.Environments {
-		fmt.Printf("%-32s", m.PublicURL(e.Host))
+		label := e.Host
+		if h, ok := displayHosts[e.Host]; ok {
+			label = h
+		}
+		fmt.Printf("%-32s", "https://"+label+"."+tld)
 		var parts []string
 		for _, r := range e.Routes {
 			if r.IsRun() {
@@ -577,6 +618,9 @@ func cmdUp(args []string) error {
 			} else {
 				parts = append(parts, r.Path+" -> "+r.Target)
 			}
+		}
+		if e.Protect != "" {
+			parts = append(parts, "(protected)")
 		}
 		fmt.Printf("  %s\n", strings.Join(parts, ", "))
 	}
@@ -691,7 +735,7 @@ func ensureLocalRelay(m *manifest.Manifest, reg *projects.Registry) error {
 
 	sc, _ := config.ServerFor(tld)
 	if sc.APIKey == "" {
-		key, err := localrelay.CreateAPIKey(tld, "auto-created by roxey up")
+		key, err := localrelay.LoginAndCreateKey(tld, "auto-created by roxey up")
 		if err != nil {
 			return err
 		}
@@ -1042,11 +1086,11 @@ func cmdServiceRelay(args []string) error {
 	}
 
 	sc, _ := config.ServerFor(tld)
-	adminUser, adminPass := sc.AdminUser, sc.AdminPass
-	if adminUser == "" || adminPass == "" {
-		adminUser, adminPass = localrelay.RandomToken(), localrelay.RandomToken()
+	adminEmail, adminPass := sc.AdminEmail, sc.AdminPass
+	if adminEmail == "" || adminPass == "" {
+		adminEmail, adminPass = localrelay.RandomToken()+"@localhost", localrelay.RandomToken()
 		_ = config.SetServer(tld, config.ServerConfig{
-			Local: true, AdminUser: adminUser, AdminPass: adminPass, APIKey: sc.APIKey,
+			Local: true, AdminEmail: adminEmail, AdminPass: adminPass, APIKey: sc.APIKey,
 		})
 	}
 
@@ -1059,8 +1103,9 @@ func cmdServiceRelay(args []string) error {
 	env := append(os.Environ(),
 		"ROXEY_DOMAIN="+tld,
 		"ROXEY_ADMIN_HOST=roxey."+tld,
-		"ROXEY_ADMIN_USER="+adminUser,
-		"ROXEY_ADMIN_PASS="+adminPass,
+		"ROXEY_SINGLE_USER=1",
+		"ROXEY_ADMIN_EMAIL="+adminEmail,
+		"ROXEY_ADMIN_PASSWORD="+adminPass,
 		"ROXEY_DB_PATH="+filepath.Join(stateDir, "local_"+strings.ReplaceAll(tld, ".", "_")+".db"),
 		"PORT=443",
 		"ROXEY_TLS_CERT="+filepath.Join(certDir, "leaf.crt"),

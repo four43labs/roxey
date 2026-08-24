@@ -38,7 +38,9 @@ cd cli && go build -o roxey . && mv roxey /usr/local/bin/
 
 ### Authenticating
 
-Create an API key on the [relay dashboard](https://roxey.f43.run) (Basic Auth), then:
+1. [Create an account](https://roxey.f43.run/signup) on the relay dashboard
+2. Sign in and click **[ generate new key ]**
+3. Save it in the CLI:
 
 ```bash
 roxey auth <api-key-from-dashboard>
@@ -46,7 +48,7 @@ roxey auth <api-key-from-dashboard>
 roxey auth
 ```
 
-Keys are stored per relay in `~/.roxey/config.json`. Working against multiple relays? Save one per TLD:
+Keys are shown once at creation and stored per relay in `~/.roxey/config.json`. Working against multiple relays? Save one per TLD:
 
 ```bash
 roxey auth --tld dev.mycompany.dev <key>
@@ -58,8 +60,10 @@ The fastest way to try Roxey — put a local dev server on a public URL:
 
 ```bash
 roxey start myapp localhost:3000
-# -> https://myapp.f43.run
+# -> https://myapp-k3f9q2.f43.run  (host assigned by the relay)
 ```
+
+On the hosted relay every tunnel gets its own unguessable hostname (`<service>-<suffix>`), so nobody can find or collide with your previews.
 
 ### Path routing: many services, one domain
 
@@ -71,6 +75,26 @@ roxey start "myapp/api/*" localhost:8000    # /api/* -> backend
 roxey list                                  # see what's running
 roxey stop myapp                            # stops all routes for myapp
 ```
+
+### Protecting previews
+
+Tunnel URLs are unguessable, but anyone who gets one can use it. Add a shared secret and visitors must unlock the preview before any traffic reaches your app:
+
+```bash
+roxey start myapp localhost:3000 --protect swordfish
+```
+
+or in a manifest:
+
+```yaml
+environments:
+  - host: app
+    protect: swordfish   # visitors get a password prompt
+    routes:
+      "/": localhost:3000
+```
+
+The gate runs on the relay — your app never sees failed attempts. Browsers get an unlock page (cookie keeps them signed in); scripts can pass `?access_token=swordfish` or HTTP Basic auth (`curl -u x:swordfish`).
 
 ### Project topology: `roxey.yaml` and `up`/`down`
 
@@ -276,7 +300,7 @@ In `local` mode the same architecture runs entirely on your machine: the relay b
 
 The repository is two independent Go modules plus an npm wrapper:
 
-- **`backend/`** — the relay. A single HTTP server that terminates traffic for `*.<domain>`, resolves each request against an in-memory routing table, and pipes connections as raw TCP streams over multiplexed WebSockets. Also serves a Basic-Auth admin API and dashboard for API keys and live tunnel status, backed by SQLite. Ships as a Docker image and prebuilt binaries.
+- **`backend/`** — the relay. A single HTTP server that terminates traffic for `*.<domain>`, resolves each request against an in-memory routing table, and pipes connections as raw TCP streams over multiplexed WebSockets. Also serves an account dashboard (signup/login, API keys, live tunnel status, protected previews), backed by SQLite. Ships as a Docker image and prebuilt binaries.
 - **`cli/`** — the `roxey` binary users install. Handles authentication, manifest loading/validation, spawning and supervising services, and running the background tunnel workers. This is what npm distributes as `@four43labs/roxey`.
 - **`npm/`** — a thin installer package; downloads the matching platform binary from GitHub Releases on first run.
 
@@ -295,22 +319,41 @@ Point a wildcard DNS record (`*.your-domain.com`) at your server — through Clo
 ```bash
 docker run -d -p 8080:8080 \
   -e ROXEY_DOMAIN=your-domain.com \
-  -e ROXEY_ADMIN_USER=admin \
-  -e ROXEY_ADMIN_PASS=change-me \
+  -e ROXEY_SESSION_SECRET=$(openssl rand -hex 32) \
   -v roxey-data:/data \
   ghcr.io/four43labs/roxey-relay:latest
 ```
 
-The relay writes its SQLite database to `/data/roxey.db` (`ROXEY_DB_PATH`); mount the volume so API keys survive restarts. Then visit `https://roxey.your-domain.com` to generate keys, and authenticate clients with `ROXEY_DOMAIN=your-domain.com roxey auth <key>`.
+The relay writes its SQLite database to `/data/roxey.db` (`ROXEY_DB_PATH`); mount the volume so accounts and API keys survive restarts. Visitors sign up at `https://roxey.your-domain.com`, generate keys, and authenticate clients with `ROXEY_DOMAIN=your-domain.com roxey auth <key>`.
+
+Running it just for yourself? Skip open signup entirely with single-user mode:
+
+```bash
+docker run -d -p 8080:8080 \
+  -e ROXEY_DOMAIN=your-domain.com \
+  -e ROXEY_SINGLE_USER=1 \
+  -e ROXEY_ADMIN_EMAIL=me@example.com \
+  -e ROXEY_ADMIN_PASSWORD=change-me \
+  -e ROXEY_SESSION_SECRET=$(openssl rand -hex 32) \
+  -v roxey-data:/data \
+  ghcr.io/four43labs/roxey-relay:latest
+```
+
+Single-user mode seeds one account (idempotently — env wins on restart) and serves tunnels on bare `<service>.<tld>` hostnames instead of namespaced ones.
 
 Additional server options:
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `PORT` | `8080` | Listen port |
-| `ROXEY_ADMIN_HOST` | `roxey.<domain>` | Host serving the admin API/dashboard |
+| `ROXEY_ADMIN_HOST` | `roxey.<domain>` | Host serving the dashboard/API |
 | `ROXEY_DB_PATH` | `roxey.db` | SQLite location |
+| `ROXEY_SESSION_SECRET` | generated & persisted | HMAC key for session/gate cookies |
+| `ROXEY_SINGLE_USER` | unset | `1` disables signup, seeds one account, bare hosts |
+| `ROXEY_ADMIN_EMAIL` / `ROXEY_ADMIN_PASSWORD` | — | Account credentials in single-user mode |
 | `ROXEY_TLS_CERT` / `ROXEY_TLS_KEY` | unset | Serve HTTPS directly (otherwise terminate TLS upstream) |
+
+> Upgrading from a pre-accounts relay? Databases cannot be migrated — delete `roxey.db` and re-create your keys.
 
 Releases are tagged `vX.Y.Z`; a single tag publishes the Docker image, both binaries, and the npm package together.
 

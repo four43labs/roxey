@@ -46,8 +46,11 @@ type Route struct {
 func (r *Route) IsRun() bool { return r.Command != "" }
 
 type Environment struct {
-	Host   string  `yaml:"host"`
-	Routes []Route `yaml:"routes"`
+	Host string `yaml:"host"`
+	// Protect, when set, requires visitors to enter this shared secret
+	// before any traffic reaches the environment's routes.
+	Protect string  `yaml:"protect"`
+	Routes  []Route `yaml:"routes"`
 }
 
 type Manifest struct {

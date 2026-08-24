@@ -17,6 +17,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/cookiejar"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -208,17 +209,19 @@ func EnsureRunning(tld string) error {
 	}
 
 	sc, _ := config.ServerFor(tld)
-	adminUser, adminPass := sc.AdminUser, sc.AdminPass
-	if adminUser == "" || adminPass == "" {
-		adminUser, adminPass = RandomToken(), RandomToken()
+	adminEmail, adminPass := sc.AdminEmail, sc.AdminPass
+	if adminEmail == "" || adminPass == "" {
+		adminEmail = RandomToken() + "@localhost"
+		adminPass = RandomToken()
 	}
 
 	certDir := config.CertDir()
 	envs := []string{
 		"ROXEY_DOMAIN=" + tld,
 		"ROXEY_ADMIN_HOST=" + RelayHost(tld),
-		"ROXEY_ADMIN_USER=" + adminUser,
-		"ROXEY_ADMIN_PASS=" + adminPass,
+		"ROXEY_SINGLE_USER=1",
+		"ROXEY_ADMIN_EMAIL=" + adminEmail,
+		"ROXEY_ADMIN_PASSWORD=" + adminPass,
 		"ROXEY_DB_PATH=" + filepath.Join(config.Dir(), "local_"+strings.ReplaceAll(tld, ".", "_")+".db"),
 		"PORT=" + listenPort,
 		"ROXEY_TLS_CERT=" + filepath.Join(certDir, "leaf.crt"),
@@ -238,7 +241,7 @@ func EnsureRunning(tld string) error {
 	for time.Now().Before(deadline) {
 		if HealthOK(tld) {
 			if err := config.SetServer(tld, config.ServerConfig{
-				Local: true, AdminUser: adminUser, AdminPass: adminPass, APIKey: sc.APIKey,
+				Local: true, AdminEmail: adminEmail, AdminPass: adminPass, APIKey: sc.APIKey,
 			}); err != nil {
 				return err
 			}
@@ -249,25 +252,50 @@ func EnsureRunning(tld string) error {
 	return fmt.Errorf("local relay did not become healthy within %s (check sudo output)", spawnExpiry)
 }
 
-// CreateAPIKey creates a fresh key via the relay's Basic-Auth admin API and
-// returns its plaintext (shown once).
-func CreateAPIKey(tld, label string) (string, error) {
+// LoginAndCreateKey authenticates against the relay with the account the
+// CLI generated at spawn time and creates a fresh API key, returning its
+// plaintext (shown once).
+func LoginAndCreateKey(tld, label string) (string, error) {
 	sc, ok := config.ServerFor(tld)
-	if !ok || sc.AdminUser == "" || sc.AdminPass == "" {
-		return "", fmt.Errorf("no admin credentials saved for %s", tld)
+	if !ok || sc.AdminEmail == "" || sc.AdminPass == "" {
+		return "", fmt.Errorf("no local relay account saved for %s", tld)
 	}
 	client, err := healthClient(tld)
 	if err != nil {
 		return "", err
 	}
-	body := strings.NewReader(`{"label":` + mustJSON(label) + `}`)
-	req, err := http.NewRequest(http.MethodPost, "https://127.0.0.1/api/keys", body)
+
+	// Login stores a session cookie on the client.
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		return "", err
+	}
+	client.Jar = jar
+	loginBody := strings.NewReader(`{"email":` + mustJSON(sc.AdminEmail) + `,"password":` + mustJSON(sc.AdminPass) + `}`)
+	req, err := http.NewRequest(http.MethodPost, "https://127.0.0.1/api/auth/login", loginBody)
 	if err != nil {
 		return "", err
 	}
 	req.Host = RelayHost(tld)
-	req.SetBasicAuth(sc.AdminUser, sc.AdminPass)
+	req.Header.Set("Content-Type", "application/json")
 	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+		return "", fmt.Errorf("relay login: %s: %s", resp.Status, raw)
+	}
+
+	keyBody := strings.NewReader(`{"label":` + mustJSON(label) + `}`)
+	req, err = http.NewRequest(http.MethodPost, "https://127.0.0.1/api/keys", keyBody)
+	if err != nil {
+		return "", err
+	}
+	req.Host = RelayHost(tld)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = client.Do(req)
 	if err != nil {
 		return "", err
 	}

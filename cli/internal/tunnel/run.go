@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/hashicorp/yamux"
@@ -68,8 +69,9 @@ func handshakeReason(resp *http.Response) string {
 
 // Run connects to the relay for tld (at roxey.<tld>) and blocks, bridging
 // tunneled streams to the local target, until the connection drops or the
-// process is signaled.
-func Run(tld, service, pathPrefix, target string) error {
+// process is signaled. When protect is non-empty the public URL requires
+// that shared secret.
+func Run(tld, service, pathPrefix, target, protect string) error {
 	sc, ok := config.ServerFor(tld)
 	if !ok || sc.APIKey == "" {
 		return fmt.Errorf("no API key saved for %s, run `roxey auth --tld %s <key>` first", tld, tld)
@@ -89,12 +91,16 @@ func Run(tld, service, pathPrefix, target string) error {
 	q := u.Query()
 	q.Set("service", service)
 	q.Set("path", pathPrefix)
+	if protect != "" {
+		q.Set("protect", protect)
+	}
 	u.RawQuery = q.Encode()
 
 	hdr := http.Header{}
 	hdr.Set("Authorization", "Bearer "+sc.APIKey)
 
 	dialer := *websocket.DefaultDialer
+	dialer.HandshakeTimeout = 30 * time.Second
 	if addr := os.Getenv("ROXEY_RELAY_ADDR"); addr != "" { // force-dial a different address than the URL host
 		dialer.NetDialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
 			var d net.Dialer
@@ -106,6 +112,19 @@ func Run(tld, service, pathPrefix, target string) error {
 		return fmt.Errorf("connect: %w%s", err, handshakeReason(resp))
 	}
 	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Time{})
+
+	// The relay's first message assigns our public host (it may differ from
+	// <service>.<tld> on hosted relays, which namespace per account+service).
+	_, greeting, err := conn.ReadMessage()
+	if err != nil {
+		return fmt.Errorf("read assigned host: %w", err)
+	}
+	publicHost, ok := strings.CutPrefix(string(greeting), "host:")
+	if !ok || publicHost == "" {
+		conn.Close()
+		return fmt.Errorf("unexpected relay greeting %q", greeting)
+	}
 
 	sess, err := yamux.Client(NewWSNetConn(conn), nil)
 	if err != nil {
@@ -113,8 +132,11 @@ func Run(tld, service, pathPrefix, target string) error {
 	}
 	defer sess.Close()
 
-	publicURL := fmt.Sprintf("https://%s.%s%s", service, tld, pathPrefix)
-	fmt.Printf("[roxey] connected: %s -> %s\n", publicURL, target)
+	suffix := ""
+	if protect != "" {
+		suffix = "  (protected)"
+	}
+	fmt.Printf("[roxey] connected: https://%s.%s%s -> %s%s\n", publicHost, tld, pathPrefix, target, suffix)
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
