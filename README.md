@@ -19,13 +19,13 @@ It is designed for the messy reality of modern local development: a frontend, a 
 No install step via npx (macOS/Linux) — the binary is downloaded from GitHub Releases on first run and cached in `~/.roxey/bin`:
 
 ```bash
-npx @abhikrishnaram/roxey --help
+npx @four43labs/roxey --help
 ```
 
 Or install globally:
 
 ```bash
-npm install -g @abhikrishnaram/roxey
+npm install -g @four43labs/roxey
 ```
 
 Or grab a prebuilt binary directly from the [releases page](https://github.com/four43labs/roxey/releases), or build from source:
@@ -194,7 +194,7 @@ In `local` mode the same architecture runs entirely on your machine: the relay b
 The repository is two independent Go modules plus an npm wrapper:
 
 - **`backend/`** — the relay. A single HTTP server that terminates traffic for `*.<domain>`, resolves each request against an in-memory routing table, and pipes connections as raw TCP streams over multiplexed WebSockets. Also serves a Basic-Auth admin API and dashboard for API keys and live tunnel status, backed by SQLite. Ships as a Docker image and prebuilt binaries.
-- **`cli/`** — the `roxey` binary users install. Handles authentication, manifest loading/validation, spawning and supervising services, and running the background tunnel workers. This is what npm distributes as `@abhikrishnaram/roxey`.
+- **`cli/`** — the `roxey` binary users install. Handles authentication, manifest loading/validation, spawning and supervising services, and running the background tunnel workers. This is what npm distributes as `@four43labs/roxey`.
 - **`npm/`** — a thin installer package; downloads the matching platform binary from GitHub Releases on first run.
 
 ## Choosing the Relay Backend

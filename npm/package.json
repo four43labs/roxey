@@ -1,5 +1,5 @@
 {
-  "name": "@abhikrishnaram/roxey",
+  "name": "@four43labs/roxey",
   "version": "0.1.0",
   "description": "CLI for Roxey — ngrok-style tunnels to *.f43.run",
   "bin": {
