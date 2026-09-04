@@ -61,6 +61,23 @@ environments:
 	}
 }
 
+func TestEnvironmentProtectDecoded(t *testing.T) {
+	m, err := Load(write(t, `
+relay_server: {tld: dev}
+environments:
+  - host: app
+    protect: swordfish
+    routes:
+      "/": localhost:3000
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := m.Environments[0].Protect; got != "swordfish" {
+		t.Fatalf("protect = %q", got)
+	}
+}
+
 func TestLocalDefaultsToDevTLD(t *testing.T) {
 	m, err := Load(write(t, `
 relay_server:
@@ -191,6 +208,58 @@ environments:
 `))
 	if err == nil || !contains(err.Error(), "relay_server") {
 		t.Fatalf("expected relay_server required error, got %v", err)
+	}
+}
+
+func TestResolveEnvironmentTemplates(t *testing.T) {
+	m, err := Load(write(t, `
+relay_server: {tld: f43.run}
+environments:
+  - host: app.verifycate
+    routes:
+      "/":
+        command: app
+        port: 4100
+        environment:
+          API_URL: https://{{host:api.verifycate}}:{{port:api.verifycate}}/{{online}}
+  - host: api.verifycate
+    routes:
+      "/": {command: api, port: 4200}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.AssignedHostMap = map[string]string{
+		"app.verifycate": "app-abc123",
+		"api.verifycate": "api-def456",
+	}
+	if err := m.ResolveEnvTemplates(true); err != nil {
+		t.Fatal(err)
+	}
+	got := m.Environments[0].Routes[0].Environment["API_URL"]
+	if want := "https://api-def456.f43.run:4200/1"; got != want {
+		t.Fatalf("resolved template = %q, want %q", got, want)
+	}
+}
+
+func TestResolvePortTemplateErrorsClearly(t *testing.T) {
+	m, err := Load(write(t, `
+relay_server: {tld: dev}
+environments:
+  - host: app
+    routes:
+      "/":
+        command: app
+        port: 4100
+        environment:
+          BAD: "{{port:missing}}"
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = m.ResolveEnvTemplates(false)
+	if err == nil || !contains(err.Error(), `unknown host "missing"`) {
+		t.Fatalf("expected unknown port host error, got %v", err)
 	}
 }
 

@@ -65,9 +65,16 @@ type Manifest struct {
 	// (identical unless a fork-preview rewrote them). Used to resolve
 	// {{host:X}} placeholders in route environment values.
 	HostMap map[string]string
+
+	// AssignedHostMap contains hosted-relay labels returned by /api/lookup,
+	// keyed by the original declared host. Local manifests leave it empty.
+	AssignedHostMap map[string]string
 }
 
-var hostTemplateRe = regexp.MustCompile(`\{\{\s*host:([a-z0-9.-]+)\s*\}\}`)
+var (
+	hostTemplateRe = regexp.MustCompile(`\{\{\s*host:([a-z0-9.-]+)\s*\}\}`)
+	portTemplateRe = regexp.MustCompile(`\{\{\s*port:([a-z0-9.-]+)\s*\}\}`)
+)
 
 var hostRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
 
@@ -104,28 +111,76 @@ func (m *Manifest) initHostMap() {
 	}
 }
 
-// ResolveEnvTemplates replaces {{host:X}} placeholders in every route's
-// environment values with the effective public host of environment X
-// (FQDN, without scheme). Unknown hosts resolve to themselves.
-func (m *Manifest) ResolveEnvTemplates() {
-	sub := func(match []byte) []byte {
+// ResolveEnvTemplates replaces public host, spawned root-route port, and
+// online-mode placeholders in route environment values.
+func (m *Manifest) ResolveEnvTemplates(online bool) error {
+	hostSub := func(match []byte) []byte {
 		name := string(hostTemplateRe.FindSubmatch(match)[1])
 		host := name
-		if final, ok := m.HostMap[name]; ok {
+		if assigned, ok := m.AssignedHostMap[name]; ok {
+			host = assigned
+		} else if final, ok := m.HostMap[name]; ok {
 			host = final
 		}
 		return []byte(host + "." + m.RelayServer.TLD)
+	}
+	portFor := func(name string) (int, error) {
+		effective, ok := m.HostMap[name]
+		if !ok {
+			return 0, fmt.Errorf("unknown host %q in port template", name)
+		}
+		count, port := 0, 0
+		for i := range m.Environments {
+			if m.Environments[i].Host != effective {
+				continue
+			}
+			for j := range m.Environments[i].Routes {
+				r := &m.Environments[i].Routes[j]
+				if r.Path == "/" && r.IsRun() {
+					count++
+					port = r.Port
+				}
+			}
+		}
+		if count == 0 {
+			return 0, fmt.Errorf("host %q has no spawned root route for port template", name)
+		}
+		if count > 1 {
+			return 0, fmt.Errorf("host %q has multiple spawned root routes for port template", name)
+		}
+		if port <= 0 {
+			return 0, fmt.Errorf("host %q spawned root route has no assigned port", name)
+		}
+		return port, nil
+	}
+	onlineValue := ""
+	if online {
+		onlineValue = "1"
 	}
 	for i := range m.Environments {
 		env := &m.Environments[i]
 		for j := range env.Routes {
 			for k, v := range env.Routes[j].Environment {
-				if hostTemplateRe.Match([]byte(v)) {
-					env.Routes[j].Environment[k] = string(hostTemplateRe.ReplaceAllFunc([]byte(v), sub))
+				resolved := hostTemplateRe.ReplaceAllFunc([]byte(v), hostSub)
+				var resolveErr error
+				resolved = portTemplateRe.ReplaceAllFunc(resolved, func(match []byte) []byte {
+					name := string(portTemplateRe.FindSubmatch(match)[1])
+					port, err := portFor(name)
+					if err != nil {
+						resolveErr = err
+						return match
+					}
+					return []byte(fmt.Sprintf("%d", port))
+				})
+				if resolveErr != nil {
+					return fmt.Errorf("resolve environment %s for %s%s: %w", k, env.Host, env.Routes[j].Path, resolveErr)
 				}
+				resolved = []byte(strings.ReplaceAll(string(resolved), "{{online}}", onlineValue))
+				env.Routes[j].Environment[k] = string(resolved)
 			}
 		}
 	}
+	return nil
 }
 
 func (m *Manifest) Validate() error {

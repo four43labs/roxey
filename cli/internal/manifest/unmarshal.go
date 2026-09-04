@@ -74,6 +74,10 @@ func (e *Environment) UnmarshalYAML(value *yaml.Node) error {
 			if err := valNode.Decode(&e.Host); err != nil {
 				return err
 			}
+		case "protect":
+			if err := valNode.Decode(&e.Protect); err != nil {
+				return err
+			}
 		case "routes":
 			routes, err := unmarshalRoutes(valNode)
 			if err != nil {

@@ -6,6 +6,8 @@ package main
 
 import (
 	"bufio"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"os/exec"
@@ -86,7 +88,8 @@ func usage() {
 
 Commands:
   auth [--tld <tld>] [api-key]        Save an API key for a relay server
-  up [-d] [--preview[=slug]] [file]   Bring up a manifest's environments
+  up [-d] [--preview[=slug]] [--online] [--protect <secret>] [file]
+                                      Bring up a manifest's environments
   down [file]                         Tear down a manifest's tunnels + services
   projects [--forget n] [--prune]     List known projects and their status
   service install|uninstall|status    Manage the boot-time relay daemon
@@ -166,7 +169,7 @@ func processAlive(pid int) bool {
 }
 
 // startOne spawns the detached tunnel worker for one route and records it.
-func startOne(tld, service, pathPrefix, target, protect, manifestPath string) error {
+func startOne(tld, service, pathPrefix, target, protect, gateGroup, manifestPath string) error {
 	key := tunnelKey(service, pathPrefix)
 
 	tunnels, err := config.LoadTunnels()
@@ -192,8 +195,11 @@ func startOne(tld, service, pathPrefix, target, protect, manifestPath string) er
 	defer logFile.Close()
 
 	runArgs := []string{"_run", tld, service, pathPrefix, target}
-	if protect != "" {
+	if protect != "" || gateGroup != "" {
 		runArgs = append(runArgs, protect)
+	}
+	if gateGroup != "" {
+		runArgs = append(runArgs, gateGroup)
 	}
 	proc := exec.Command(self, runArgs...)
 	proc.Stdout = logFile
@@ -240,7 +246,7 @@ func cmdStart(args []string) error {
 	}
 
 	service, pathPrefix := parseServiceSpec(spec)
-	if err := startOne(tld, service, pathPrefix, target, protect, ""); err != nil {
+	if err := startOne(tld, service, pathPrefix, target, protect, "", ""); err != nil {
 		return err
 	}
 	fmt.Printf("Tunnel started: https://%s.%s%s -> %s\n", service, tld, pathPrefix, target)
@@ -322,13 +328,16 @@ func cmdList() error {
 
 func cmdRun(args []string) error {
 	if len(args) < 4 {
-		return fmt.Errorf("usage: roxey _run <tld> <service> <pathPrefix> <target> [protect]")
+		return fmt.Errorf("usage: roxey _run <tld> <service> <pathPrefix> <target> [protect] [gate-group]")
 	}
-	protect := ""
+	protect, gateGroup := "", ""
 	if len(args) > 4 {
 		protect = args[4]
 	}
-	return tunnel.Run(args[0], args[1], args[2], args[3], protect)
+	if len(args) > 5 {
+		gateGroup = args[5]
+	}
+	return tunnel.Run(args[0], args[1], args[2], args[3], protect, gateGroup)
 }
 
 // ── up / down ────────────────────────────────────────────────────────────
@@ -340,33 +349,64 @@ type runRoute struct {
 	route   *manifest.Route
 }
 
-func cmdUp(args []string) error {
-	detach := false
-	previewFlag := false
-	var previewSlug string
-	var file string
-	var project string
+type upOptions struct {
+	detach       bool
+	preview      bool
+	previewSlug  string
+	online       bool
+	protect      string
+	manifestFile string
+	project      string
+}
+
+func parseUpOptions(args []string) (upOptions, error) {
+	var opts upOptions
+	protectSet := false
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
 		case a == "-d" || a == "--detach":
-			detach = true
+			opts.detach = true
 		case a == "--preview":
-			previewFlag = true
+			opts.preview = true
 		case strings.HasPrefix(a, "--preview="):
-			previewFlag = true
-			previewSlug = strings.TrimPrefix(a, "--preview=")
+			opts.preview = true
+			opts.previewSlug = strings.TrimPrefix(a, "--preview=")
+		case a == "--online":
+			opts.online = true
+		case a == "--protect":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return opts, fmt.Errorf("--protect requires a secret")
+			}
+			i++
+			protectSet = true
+			opts.protect = args[i]
+		case strings.HasPrefix(a, "--protect="):
+			protectSet = true
+			opts.protect = strings.TrimPrefix(a, "--protect=")
 		case a == "--project" && i+1 < len(args):
 			i++
-			project = args[i]
+			opts.project = args[i]
 		case strings.HasPrefix(a, "--project="):
-			project = strings.TrimPrefix(a, "--project=")
-		case file == "" && !strings.HasPrefix(a, "-"):
-			file = a
+			opts.project = strings.TrimPrefix(a, "--project=")
+		case opts.manifestFile == "" && !strings.HasPrefix(a, "-"):
+			opts.manifestFile = a
 		default:
-			return fmt.Errorf("unexpected argument %q", a)
+			return opts, fmt.Errorf("unexpected argument %q", a)
 		}
 	}
+	if protectSet && opts.protect == "" {
+		return opts, fmt.Errorf("--protect requires a non-empty secret")
+	}
+	return opts, nil
+}
+
+func cmdUp(args []string) error {
+	opts, err := parseUpOptions(args)
+	if err != nil {
+		return err
+	}
+	file, project := opts.manifestFile, opts.project
 
 	// --project resolves the manifest from the central registry.
 	if project != "" {
@@ -383,9 +423,9 @@ func cmdUp(args []string) error {
 		}
 		file = filepath.Join(p.Path, "roxey.yaml")
 	}
-	if previewFlag && previewSlug != "" {
+	if opts.preview && opts.previewSlug != "" {
 		// explicit slug only makes sense from the manifest's own directory
-	} else if previewFlag && file == "" {
+	} else if opts.preview && file == "" {
 		file = "roxey.yaml"
 	}
 	if file == "" {
@@ -404,8 +444,9 @@ func cmdUp(args []string) error {
 	// Preview identity: explicit flag wins; otherwise auto-detect worktrees.
 	projectName := filepath.Base(filepath.Dir(absFile))
 	branch := ""
-	isPreview := previewFlag
-	if previewFlag {
+	previewSlug := opts.previewSlug
+	isPreview := opts.preview
+	if opts.preview {
 		if previewSlug != "" {
 			branch = previewSlug
 			previewSlug = preview.Slugify(previewSlug)
@@ -421,10 +462,27 @@ func cmdUp(args []string) error {
 		branch = b
 		previewSlug = preview.Slugify(b)
 	}
+	if opts.online && !isPreview && hasDottedHosts(m) {
+		isPreview = true
+		previewSlug = preview.PathSlug(projectName, m.Dir)
+		branch = previewSlug
+	}
 	if isPreview {
 		projectName = preview.Apply(m, projectName, previewSlug)
 	}
-	m.ResolveEnvTemplates()
+	if opts.online {
+		oldTLD, wasLocal := m.RelayServer.TLD, m.RelayServer.Local
+		m.RelayServer.Local = false
+		m.RelayServer.TLD = defaultTLD()
+		if wasLocal || oldTLD != m.RelayServer.TLD {
+			m.RelayServer.APIKey = ""
+		}
+	}
+	if opts.protect != "" {
+		for i := range m.Environments {
+			m.Environments[i].Protect = opts.protect
+		}
+	}
 
 	absDir := m.Dir
 
@@ -479,6 +537,35 @@ func cmdUp(args []string) error {
 		}
 	}
 
+	if err := preview.AssignPorts(m, isPreview, runner.FreePort); err != nil {
+		return err
+	}
+
+	// Hosted labels include the account suffix. Resolve them before route
+	// environment templates so children receive authoritative public hosts.
+	displayHosts := map[string]string{}
+	if !m.RelayServer.Local && apiKey != "" {
+		requested := make([]string, 0, len(m.Environments))
+		for _, e := range m.Environments {
+			requested = append(requested, e.Host)
+		}
+		displayHosts, err = relayapi.LookupHosts(tld, apiKey, requested)
+		if err != nil {
+			return fmt.Errorf("lookup hosted relay names: %w", err)
+		}
+		m.AssignedHostMap = map[string]string{}
+		for declared, effective := range m.HostMap {
+			assigned, ok := displayHosts[effective]
+			if !ok || assigned == "" {
+				return fmt.Errorf("hosted relay did not assign a host for %q", effective)
+			}
+			m.AssignedHostMap[declared] = assigned
+		}
+	}
+	if err := m.ResolveEnvTemplates(opts.online); err != nil {
+		return err
+	}
+
 	// Collect run-routes and spawn services first.
 	var runs []runRoute
 	var proxyRoutes []runRoute
@@ -486,13 +573,6 @@ func cmdUp(args []string) error {
 		e := &m.Environments[ei]
 		for ri := range e.Routes {
 			r := &e.Routes[ri]
-			if r.IsRun() && r.Port == 0 { // preview/auto port: assign a free one
-				port, err := runner.FreePort()
-				if err != nil {
-					return fmt.Errorf("assign free port for %s%s: %w", e.Host, r.Path, err)
-				}
-				r.Port = port
-			}
 			rr := runRoute{name: e.Host + r.Path, env: e.Host, protect: e.Protect, route: r}
 			if r.IsRun() {
 				runs = append(runs, rr)
@@ -534,7 +614,16 @@ func cmdUp(args []string) error {
 		return err
 	}
 
+	// Reclaim declared run-route ports still held by orphans (e.g. roxey
+	// itself was SIGKILLed and never tore its setsid'd children down).
+	for _, rr := range runs {
+		if pids := runner.ReclaimPort(rr.route.Port); len(pids) > 0 {
+			fmt.Printf("[service] reclaimed port %-6d (was held by pid %v)\n", rr.route.Port, pids)
+		}
+	}
+
 	childDone := make(map[string]<-chan struct{})
+	detach := opts.detach
 
 	startService := func(rr runRoute) error {
 		r := rr.route
@@ -579,6 +668,14 @@ func cmdUp(args []string) error {
 		return err
 	}
 
+	gateGroup := ""
+	if hasProtectedEnvironment(m) {
+		gateGroup, err = newGateGroup()
+		if err != nil {
+			return err
+		}
+	}
+
 	// Open tunnels for every route.
 	for _, rr := range append(append([]runRoute{}, runs...), proxyRoutes...) {
 		r := rr.route
@@ -587,24 +684,12 @@ func cmdUp(args []string) error {
 			target = fmt.Sprintf("localhost:%d", r.Port)
 		}
 		pathPrefix := strings.TrimSuffix(r.Path, "/") // "/" (root) registers as ""
-		if err := startOne(tld, rr.env, pathPrefix, target, rr.protect, absFile); err != nil {
+		if err := startOne(tld, rr.env, pathPrefix, target, rr.protect, gateGroup, absFile); err != nil {
 			return err
 		}
 	}
 
 	fmt.Println()
-	// Hosted relays namespace every service per account+service; ask the
-	// relay for the real hosts so the printed URLs are authoritative.
-	displayHosts := map[string]string{}
-	if !m.RelayServer.Local && apiKey != "" {
-		services := make([]string, 0, len(m.Environments))
-		for _, e := range m.Environments {
-			services = append(services, e.Host)
-		}
-		if h, err := relayapi.LookupHosts(tld, apiKey, services); err == nil {
-			displayHosts = h
-		}
-	}
 	for _, e := range m.Environments {
 		label := e.Host
 		if h, ok := displayHosts[e.Host]; ok {
@@ -636,7 +721,9 @@ func cmdUp(args []string) error {
 // everything belonging to this manifest down.
 func waitForeground(childDone map[string]<-chan struct{}, manifestPath string) error {
 	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	// SIGHUP/SIGQUIT included so closing the terminal or an abrupt stop still
+	// tears down spawned services instead of orphaning them.
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
 
 	exited := make(chan string, 1)
 	for name, done := range childDone {
@@ -1396,6 +1483,32 @@ func svcKey(manifestPath, name string) string {
 
 func sanitizeName(n string) string {
 	return strings.NewReplacer("/", "_", ":", "_").Replace(n)
+}
+
+func hasDottedHosts(m *manifest.Manifest) bool {
+	for _, e := range m.Environments {
+		if strings.Contains(e.Host, ".") {
+			return true
+		}
+	}
+	return false
+}
+
+func hasProtectedEnvironment(m *manifest.Manifest) bool {
+	for _, e := range m.Environments {
+		if e.Protect != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func newGateGroup() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generate gate group: %w", err)
+	}
+	return "up_" + hex.EncodeToString(b), nil
 }
 
 func now() string { return time.Now().UTC().Format(time.RFC3339) }

@@ -53,7 +53,34 @@ func writeHosts(newBlock string) error {
 	if err != nil {
 		return err
 	}
-	lines := strings.Split(string(data), "\n")
+	content := mergeHostsBlock(string(data), newBlock)
+	if content == string(data) {
+		return nil
+	}
+
+	tmp, err := os.CreateTemp("", "roxey-hosts-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.WriteString(content); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	cmd := exec.Command("sudo", "-p", "roxey needs admin rights to update /etc/hosts: ",
+		"cp", tmp.Name(), "/etc/hosts")
+	cmd.Stdin = os.Stdin
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("update /etc/hosts: %v: %s", err, out)
+	}
+	return nil
+}
+
+func mergeHostsBlock(existing, newBlock string) string {
+	lines := strings.Split(existing, "\n")
 	var kept []string
 	inBlock := false
 	for _, l := range lines {
@@ -75,26 +102,7 @@ func writeHosts(newBlock string) error {
 		content = strings.TrimRight(content, "\n") + "\n\n"
 	}
 	content += newBlock
-
-	tmp, err := os.CreateTemp("", "roxey-hosts-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp.Name())
-	if _, err := tmp.WriteString(content); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	cmd := exec.Command("sudo", "-p", "roxey needs admin rights to update /etc/hosts: ",
-		"cp", tmp.Name(), "/etc/hosts")
-	cmd.Stdin = os.Stdin
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("update /etc/hosts: %v: %s", err, out)
-	}
-	return nil
+	return content
 }
 
 // HostsSynced is a small helper for callers to log where state went.

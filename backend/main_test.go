@@ -127,7 +127,7 @@ func TestTunnelPipe(t *testing.T) {
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		r.Host = host + "." + testDomain
-		handleTunnelRequest(reg, sessions, auth.NewLimiter(time.Minute, 100), host, w, r)
+		handleTunnelRequest(reg, sessions, auth.NewLimiter(time.Minute, 100), testDomain, false, host, w, r)
 	})
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/some/path", nil))
@@ -191,6 +191,46 @@ func TestDuplicateRegistrationRejected(t *testing.T) {
 	body, _ := io.ReadAll(resp2.Body)
 	if !strings.Contains(string(body), "already in use") {
 		t.Fatalf("reason not surfaced: %q", body)
+	}
+}
+
+func TestWebsocketRegistrationPropagatesGateGroup(t *testing.T) {
+	st := testStore(t)
+	reg := relay.NewRegistry()
+	sessions := auth.NewSessions("test-secret")
+	userID, key := makeUserWithKey(t, st, "grouped@x.test")
+
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handleWSUpgrade(upgrader, reg, st, sessions, testDomain, false, w, r)
+	}))
+	t.Cleanup(srv.Close)
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") +
+		"/_ws?service=api&path=&protect=shared&gate_group=project-123"
+	conn, resp, err := websocket.DefaultDialer.Dial(wsURL,
+		http.Header{"Authorization": {"Bearer " + key}})
+	if err != nil {
+		t.Fatalf("dial ws: %v (%v)", err, resp)
+	}
+	t.Cleanup(func() { conn.Close() })
+	host := readAssignedHost(t, conn)
+	sess, err := yamux.Client(relay.NewWSNetConn(conn), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { sess.Close() })
+
+	deadline := time.Now().Add(time.Second)
+	for reg.Resolve(host, "/") == nil && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	entry := reg.Resolve(host, "/")
+	if entry == nil {
+		t.Fatal("websocket tunnel was not registered")
+	}
+	if entry.UserID != userID || entry.GateGroup != "project-123" || entry.ProtectHash != sha256Hex("shared") {
+		t.Fatalf("registration metadata = user %q, group %q, hash %q", entry.UserID, entry.GateGroup, entry.ProtectHash)
 	}
 }
 
@@ -427,7 +467,14 @@ func TestGateFlow(t *testing.T) {
 	sessions := auth.NewSessions("gate-test-secret")
 	limiter := auth.NewLimiter(time.Minute, 100)
 
+	type upstreamRequest struct {
+		cookie, authorization, rawQuery string
+	}
+	seen := make(chan upstreamRequest, 10)
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen <- upstreamRequest{
+			cookie: r.Header.Get("Cookie"), authorization: r.Header.Get("Authorization"), rawQuery: r.URL.RawQuery,
+		}
 		_, _ = w.Write([]byte("secret-app"))
 	}))
 	defer backend.Close()
@@ -474,7 +521,7 @@ func TestGateFlow(t *testing.T) {
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		r.Host = host + "." + testDomain
-		handleTunnelRequest(reg, sessions, limiter, host, w, r)
+		handleTunnelRequest(reg, sessions, limiter, testDomain, false, host, w, r)
 	})
 
 	// Unauthenticated visitor gets the gate page, not app bytes.
@@ -516,10 +563,16 @@ func TestGateFlow(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.AddCookie(gate)
+	req.AddCookie(&http.Cookie{Name: "app_session", Value: "keep"})
+	req.AddCookie(&http.Cookie{Name: auth.GateGroupCookieName("other-user", "other-group"), Value: "other-grant"})
 	rec = httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK || rec.Body.String() != "secret-app" {
 		t.Fatalf("cookie unlock failed: %d %q", rec.Code, rec.Body.String())
+	}
+	upstream := <-seen
+	if upstream.cookie != "app_session=keep" {
+		t.Fatalf("gate cookies leaked or app cookie changed upstream: %q", upstream.cookie)
 	}
 
 	// Basic-auth header bypasses the browser flow for curl/scripts.
@@ -530,14 +583,37 @@ func TestGateFlow(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("basic-auth unlock failed: %d", rec.Code)
 	}
+	upstream = <-seen
+	if upstream.authorization != "" {
+		t.Fatalf("successful gate Authorization leaked upstream: %q", upstream.authorization)
+	}
 
 	// ?access_token= works too; a wrong token does not.
-	req = httptest.NewRequest(http.MethodGet, "/?access_token=letmein", nil)
+	req = httptest.NewRequest(http.MethodGet, "/?before=a%20b&access_token=letmein&after=2", nil)
 	rec = httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("token unlock failed: %d", rec.Code)
 	}
+	upstream = <-seen
+	if upstream.rawQuery != "before=a%20b&after=2" {
+		t.Fatalf("gate query stripping changed unrelated query: %q", upstream.rawQuery)
+	}
+
+	// An access_token used by the application remains when a cookie performed
+	// the Roxey authorization.
+	req = httptest.NewRequest(http.MethodGet, "/?access_token=application-token&keep=yes", nil)
+	req.AddCookie(gate)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("cookie unlock with app token failed: %d", rec.Code)
+	}
+	upstream = <-seen
+	if upstream.rawQuery != "access_token=application-token&keep=yes" {
+		t.Fatalf("application access_token was removed: %q", upstream.rawQuery)
+	}
+
 	req = httptest.NewRequest(http.MethodGet, "/?access_token=nope", nil)
 	rec = httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
@@ -545,6 +621,110 @@ func TestGateFlow(t *testing.T) {
 		t.Fatalf("bad token accepted: %d", rec.Code)
 	}
 	_ = entry
+}
+
+func TestGroupedGateGrantScopeAndCoexistence(t *testing.T) {
+	sessions := auth.NewSessions("gate-test-secret")
+	secretHash := sha256Hex("shared-secret")
+	entryA := &relay.Entry{Host: "web-a", UserID: "user-a", GateGroup: "project-a", ProtectHash: secretHash}
+	entryB := &relay.Entry{Host: "api-a", UserID: "user-a", GateGroup: "project-a", ProtectHash: secretHash}
+
+	unlock := httptest.NewRequest(http.MethodPost, "/", strings.NewReader("password=shared-secret"))
+	unlock.Host = entryA.Host + "." + testDomain
+	unlock.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	serveGate(sessions, entryA, testDomain, true, rec, unlock)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("group unlock status = %d", rec.Code)
+	}
+
+	groupCookieName := auth.GateGroupCookieName(entryA.UserID, entryA.GateGroup)
+	var grant *http.Cookie
+	for _, cookie := range rec.Result().Cookies() {
+		if cookie.Name == groupCookieName {
+			grant = cookie
+		}
+	}
+	if grant == nil {
+		t.Fatal("group unlock did not issue its deterministic cookie")
+	}
+	if grant.Domain != testDomain || grant.Path != "/" || !grant.Secure || !grant.HttpOnly || grant.SameSite != http.SameSiteLaxMode {
+		t.Fatalf("unsafe grouped cookie attributes: %#v", grant)
+	}
+
+	requestWith := func(cookie *http.Cookie) *http.Request {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.AddCookie(cookie)
+		return req
+	}
+	if got := visitorCredential(sessions, entryB, true, requestWith(grant)); got != gateCredentialCookie {
+		t.Fatalf("same-project sibling host rejected grant: %v", got)
+	}
+
+	boundaries := []struct {
+		name  string
+		entry *relay.Entry
+	}{
+		{"user", &relay.Entry{Host: "web-b", UserID: "user-b", GateGroup: "project-a", ProtectHash: secretHash}},
+		{"group", &relay.Entry{Host: "web-c", UserID: "user-a", GateGroup: "project-b", ProtectHash: secretHash}},
+		{"secret", &relay.Entry{Host: "web-d", UserID: "user-a", GateGroup: "project-a", ProtectHash: sha256Hex("different")}},
+	}
+	for _, test := range boundaries {
+		t.Run(test.name, func(t *testing.T) {
+			boundaryGrant := *grant
+			boundaryGrant.Name = auth.GateGroupCookieName(test.entry.UserID, test.entry.GateGroup)
+			if got := visitorCredential(sessions, test.entry, true, requestWith(&boundaryGrant)); got != gateCredentialNone {
+				t.Fatalf("grant crossed %s boundary: %v", test.name, got)
+			}
+		})
+	}
+
+	entryOther := &relay.Entry{Host: "web-other", UserID: "user-a", GateGroup: "project-other", ProtectHash: sha256Hex("other-secret")}
+	otherGrant := &http.Cookie{
+		Name:  auth.GateGroupCookieName(entryOther.UserID, entryOther.GateGroup),
+		Value: sessions.IssueGateGroup(entryOther.UserID, entryOther.GateGroup, entryOther.ProtectHash),
+	}
+	if grant.Name == otherGrant.Name {
+		t.Fatal("different preview groups share one cookie name")
+	}
+	both := httptest.NewRequest(http.MethodGet, "/", nil)
+	both.AddCookie(grant)
+	both.AddCookie(otherGrant)
+	if visitorCredential(sessions, entryA, true, both) != gateCredentialCookie ||
+		visitorCredential(sessions, entryOther, true, both) != gateCredentialCookie {
+		t.Fatal("multiple grouped grants did not coexist")
+	}
+}
+
+func TestUngroupedAndSingleUserGatesRemainHostScoped(t *testing.T) {
+	sessions := auth.NewSessions("gate-test-secret")
+	entry := &relay.Entry{Host: "one", UserID: "user-a", GateGroup: "ignored-locally", ProtectHash: sha256Hex("secret")}
+
+	unlock := httptest.NewRequest(http.MethodPost, "/", strings.NewReader("password=secret"))
+	unlock.Host = "one.local.test"
+	unlock.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	serveGate(sessions, entry, testDomain, false, rec, unlock)
+
+	var grant *http.Cookie
+	for _, cookie := range rec.Result().Cookies() {
+		if cookie.Name == auth.GateCookie {
+			grant = cookie
+		}
+	}
+	if grant == nil || grant.Domain != unlock.Host || grant.Secure {
+		t.Fatalf("legacy host cookie changed: %#v", grant)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.AddCookie(grant)
+	if visitorCredential(sessions, entry, false, req) != gateCredentialCookie {
+		t.Fatal("legacy host grant was rejected by its own entry")
+	}
+	otherHost := *entry
+	otherHost.Host = "two"
+	if visitorCredential(sessions, &otherHost, false, req) != gateCredentialNone {
+		t.Fatal("legacy host grant unlocked another host")
+	}
 }
 
 // sha256Hex is a test helper mirroring main.go's protect hashing.

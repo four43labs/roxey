@@ -67,11 +67,25 @@ func handshakeReason(resp *http.Response) string {
 	return fmt.Sprintf(" (%s)", strings.TrimSpace(string(body)))
 }
 
+func websocketURL(scheme, relayHost, service, pathPrefix, protect, gateGroup string) url.URL {
+	u := url.URL{Scheme: scheme, Host: relayHost, Path: "/_ws"}
+	q := u.Query()
+	q.Set("service", service)
+	q.Set("path", pathPrefix)
+	if protect != "" {
+		q.Set("protect", protect)
+	}
+	if gateGroup != "" {
+		q.Set("gate_group", gateGroup)
+	}
+	u.RawQuery = q.Encode()
+	return u
+}
+
 // Run connects to the relay for tld (at roxey.<tld>) and blocks, bridging
 // tunneled streams to the local target, until the connection drops or the
-// process is signaled. When protect is non-empty the public URL requires
-// that shared secret.
-func Run(tld, service, pathPrefix, target, protect string) error {
+// process is signaled. gateGroup lets manifest tunnels share one unlock gate.
+func Run(tld, service, pathPrefix, target, protect, gateGroup string) error {
 	sc, ok := config.ServerFor(tld)
 	if !ok || sc.APIKey == "" {
 		return fmt.Errorf("no API key saved for %s, run `roxey auth --tld %s <key>` first", tld, tld)
@@ -87,14 +101,7 @@ func Run(tld, service, pathPrefix, target, protect string) error {
 	if relayHost == "" {
 		relayHost = localrelay.AdminSubdomain + "." + tld
 	}
-	u := url.URL{Scheme: scheme, Host: relayHost, Path: "/_ws"}
-	q := u.Query()
-	q.Set("service", service)
-	q.Set("path", pathPrefix)
-	if protect != "" {
-		q.Set("protect", protect)
-	}
-	u.RawQuery = q.Encode()
+	u := websocketURL(scheme, relayHost, service, pathPrefix, protect, gateGroup)
 
 	hdr := http.Header{}
 	hdr.Set("Authorization", "Bearer "+sc.APIKey)

@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -225,6 +226,54 @@ func KillGroup(pid int) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	_ = syscall.Kill(neg, syscall.SIGKILL)
+}
+
+// PortListeners returns the PIDs of processes listening on the given TCP
+// port. Best-effort: returns nil when nothing is listening or lsof is
+// unavailable.
+func PortListeners(port int) []int {
+	out, err := exec.Command("lsof", "-t", "-iTCP:"+fmt.Sprint(port), "-sTCP:LISTEN").Output()
+	if err != nil && len(out) == 0 {
+		return nil
+	}
+	var pids []int
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		pid, err := strconv.Atoi(line)
+		if err != nil {
+			continue
+		}
+		pids = append(pids, pid)
+	}
+	return pids
+}
+
+// ReclaimPort frees a declared port left occupied by an orphaned process
+// (e.g. after roxey itself was killed abruptly): SIGTERMs the listeners,
+// waits briefly for them to exit, then SIGKILLs whatever remains. Returns
+// the PIDs that were reclaimed.
+func ReclaimPort(port int) []int {
+	pids := PortListeners(port)
+	if len(pids) == 0 {
+		return nil
+	}
+	for _, pid := range pids {
+		_ = syscall.Kill(pid, syscall.SIGTERM)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(PortListeners(port)) == 0 {
+			return pids
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	for _, pid := range PortListeners(port) {
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+	}
+	return pids
 }
 
 func alive(pid int) bool {

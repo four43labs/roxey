@@ -97,7 +97,10 @@ func ClearSessionCookie(w http.ResponseWriter) {
 
 // ── tunnel gate cookies ──────────────────────────────────────────────────
 
-const GateCookie = "roxey_gate"
+const (
+	GateCookie            = "roxey_gate"
+	gateGroupCookiePrefix = GateCookie + "_"
+)
 
 var errInvalidGate = errors.New("invalid gate token")
 
@@ -132,6 +135,58 @@ func (s *Sessions) VerifyGate(value, host string) bool {
 	return err == nil && time.Now().Unix() <= exp
 }
 
+// GateGroupCookieName returns a stable cookie name for one user's preview
+// group. Separate names let a browser retain grants for multiple projects.
+func GateGroupCookieName(userID, group string) string {
+	sum := sha256.Sum256([]byte(userID + "\x00" + group))
+	return gateGroupCookiePrefix + hexEncode(sum[:16])
+}
+
+func gateGroupBinding(userID, group, protectHash string) string {
+	sum := sha256.Sum256([]byte(userID + "\x00" + group + "\x00" + protectHash))
+	return hexEncode(sum[:])
+}
+
+// IssueGateGroup returns a signed grant bound to an owner, group, and secret
+// hash. A matching group name alone is not sufficient to reuse the grant.
+func (s *Sessions) IssueGateGroup(userID, group, protectHash string) string {
+	exp := strconv.FormatInt(time.Now().Add(sessionTTL).Unix(), 10)
+	payload := "gate-group:" + gateGroupBinding(userID, group, protectHash) + "|" + exp
+	return base64.RawURLEncoding.EncodeToString([]byte(payload)) + "." +
+		base64.RawURLEncoding.EncodeToString(s.sign(payload))
+}
+
+// VerifyGateGroup checks a grouped grant against all security boundaries.
+func (s *Sessions) VerifyGateGroup(value, userID, group, protectHash string) bool {
+	val, sig, ok := strings.Cut(value, ".")
+	if !ok {
+		return false
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(val)
+	if err != nil {
+		return false
+	}
+	got, err := base64.RawURLEncoding.DecodeString(sig)
+	if err != nil || !hmac.Equal(got, s.sign(string(payload))) {
+		return false
+	}
+	body, ok := strings.CutPrefix(string(payload), "gate-group:")
+	if !ok {
+		return false
+	}
+	binding, expStr, ok := strings.Cut(body, "|")
+	if !ok || !hmac.Equal([]byte(binding), []byte(gateGroupBinding(userID, group, protectHash))) {
+		return false
+	}
+	exp, err := strconv.ParseInt(expStr, 10, 64)
+	return err == nil && time.Now().Unix() <= exp
+}
+
+// IsGateCookieName identifies both the legacy host grant and grouped grants.
+func IsGateCookieName(name string) bool {
+	return name == GateCookie || strings.HasPrefix(name, gateGroupCookiePrefix)
+}
+
 // SetGateCookie writes the unlock cookie scoped to the tunnel's own host so
 // it never leaks to other subdomains.
 func SetGateCookie(w http.ResponseWriter, value, host string) {
@@ -140,6 +195,20 @@ func SetGateCookie(w http.ResponseWriter, value, host string) {
 		Value:    value,
 		Path:     "/",
 		Domain:   host,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   int(sessionTTL.Seconds()),
+	})
+}
+
+// SetGateGroupCookie writes a hosted grant for all sibling tunnel hosts.
+func SetGateGroupCookie(w http.ResponseWriter, name, value, domain string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     name,
+		Value:    value,
+		Path:     "/",
+		Domain:   domain,
+		Secure:   true,
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   int(sessionTTL.Seconds()),

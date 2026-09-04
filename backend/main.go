@@ -20,6 +20,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/url"
 	"os"
 	"regexp"
 	"strings"
@@ -120,7 +121,7 @@ func main() {
 			return
 		}
 		label := strings.TrimSuffix(host, "."+domain)
-		handleTunnelRequest(reg, sessions, gateLimiter, label, w, r)
+		handleTunnelRequest(reg, sessions, gateLimiter, domain, singleUser, label, w, r)
 	})
 
 	tlsCert, tlsKey := os.Getenv("ROXEY_TLS_CERT"), os.Getenv("ROXEY_TLS_KEY")
@@ -571,6 +572,7 @@ func handleWSUpgrade(upgrader websocket.Upgrader, reg *relay.Registry, st *store
 		Service:     service,
 		Host:        host,
 		UserID:      userID,
+		GateGroup:   r.URL.Query().Get("gate_group"),
 		ProtectHash: protectHash,
 	}, pathPrefix, sess, r.RemoteAddr)
 	if err != nil {
@@ -607,7 +609,7 @@ func handleWSUpgrade(upgrader websocket.Upgrader, reg *relay.Registry, st *store
 	}
 }
 
-func handleTunnelRequest(reg *relay.Registry, sessions *auth.Sessions, gateLimiter *auth.Limiter, host string, w http.ResponseWriter, r *http.Request) {
+func handleTunnelRequest(reg *relay.Registry, sessions *auth.Sessions, gateLimiter *auth.Limiter, domain string, singleUser bool, host string, w http.ResponseWriter, r *http.Request) {
 	entry := reg.Resolve(host, r.URL.Path)
 	if entry == nil {
 		renderRelayError(w, http.StatusBadGateway, "no active tunnel",
@@ -616,14 +618,27 @@ func handleTunnelRequest(reg *relay.Registry, sessions *auth.Sessions, gateLimit
 	}
 
 	// Gated previews check the visitor before any bytes reach the app.
-	if entry.ProtectHash != "" && !visitorAllowed(sessions, entry, r) {
+	grouped := !singleUser && entry.GateGroup != ""
+	credential := gateCredentialNone
+	if entry.ProtectHash != "" {
+		credential = visitorCredential(sessions, entry, grouped, r)
+	}
+	if entry.ProtectHash != "" && credential == gateCredentialNone {
 		ip := auth.ClientIP(r)
 		if r.Method == http.MethodPost && !gateLimiter.Allow(ip) {
 			renderRelayError(w, http.StatusTooManyRequests, "slow down", "Too many unlock attempts. Try again in a minute.")
 			return
 		}
-		serveGate(sessions, entry, w, r)
+		serveGate(sessions, entry, domain, grouped, w, r)
 		return
+	}
+
+	stripGateCookies(r.Header)
+	if credential&gateCredentialBasic != 0 {
+		r.Header.Del("Authorization")
+	}
+	if credential&gateCredentialQuery != 0 {
+		r.URL.RawQuery = removeQueryParam(r.URL.RawQuery, "access_token")
 	}
 
 	// Each public connection gets a fresh raw stream through the tunnel;
@@ -649,19 +664,41 @@ func handleTunnelRequest(reg *relay.Registry, sessions *auth.Sessions, gateLimit
 	proxy.ServeHTTP(w, r)
 }
 
-// visitorAllowed checks the three ways through a gated preview: the unlock
-// cookie, HTTP Basic credentials, or an access_token query param.
-func visitorAllowed(sessions *auth.Sessions, entry *relay.Entry, r *http.Request) bool {
-	if c, err := r.Cookie(auth.GateCookie); err == nil && sessions.VerifyGate(c.Value, entry.Host) {
-		return true
+type gateCredential uint8
+
+const (
+	gateCredentialNone   gateCredential = 0
+	gateCredentialCookie gateCredential = 1 << 0
+	gateCredentialBasic  gateCredential = 1 << 1
+	gateCredentialQuery  gateCredential = 1 << 2
+)
+
+// visitorCredential checks the three ways through a gated preview and records
+// which credential authorized it so gate secrets can be removed upstream.
+func visitorCredential(sessions *auth.Sessions, entry *relay.Entry, grouped bool, r *http.Request) gateCredential {
+	credentials := gateCredentialNone
+	cookieName := auth.GateCookie
+	if grouped {
+		cookieName = auth.GateGroupCookieName(entry.UserID, entry.GateGroup)
+	}
+	if c, err := r.Cookie(cookieName); err == nil {
+		var valid bool
+		if grouped {
+			valid = sessions.VerifyGateGroup(c.Value, entry.UserID, entry.GateGroup, entry.ProtectHash)
+		} else {
+			valid = sessions.VerifyGate(c.Value, entry.Host)
+		}
+		if valid {
+			credentials |= gateCredentialCookie
+		}
 	}
 	if u, p, ok := r.BasicAuth(); ok && checkGateSecret(entry.ProtectHash, p, u) {
-		return true
+		credentials |= gateCredentialBasic
 	}
 	if token := r.URL.Query().Get("access_token"); token != "" && checkGateSecret(entry.ProtectHash, token, "token") {
-		return true
+		credentials |= gateCredentialQuery
 	}
-	return false
+	return credentials
 }
 
 // checkGateSecret compares a presented secret against the stored hash in
@@ -674,28 +711,67 @@ func checkGateSecret(hash, secret, _ string) bool {
 
 // serveGate renders the password page (GET) or verifies a submitted password
 // and unlocks the preview via a signed cookie (POST).
-func serveGate(sessions *auth.Sessions, entry *relay.Entry, w http.ResponseWriter, r *http.Request) {
+func serveGate(sessions *auth.Sessions, entry *relay.Entry, domain string, grouped bool, w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost {
 		if err := r.ParseForm(); err != nil {
 			renderRelayError(w, http.StatusBadRequest, "bad request", "could not parse form")
 			return
 		}
 		if checkGateSecret(entry.ProtectHash, r.PostFormValue("password"), "") {
-			// Token is bound to the tunnel's internal label; the cookie
-			// itself must carry the full FQDN from the request or browsers
-			// will reject the domain.
-			auth.SetGateCookie(w, sessions.IssueGate(entry.Host), stripPort(r.Host))
+			if grouped {
+				name := auth.GateGroupCookieName(entry.UserID, entry.GateGroup)
+				auth.SetGateGroupCookie(w, name,
+					sessions.IssueGateGroup(entry.UserID, entry.GateGroup, entry.ProtectHash), domain)
+			} else {
+				// Host grants preserve the original cookie and token format.
+				auth.SetGateCookie(w, sessions.IssueGate(entry.Host), stripPort(r.Host))
+			}
 			http.Redirect(w, r, r.URL.Path, http.StatusSeeOther)
 			return
 		}
 		renderGate(w, entry.Host, true)
 		return
 	}
-	if c, err := r.Cookie(auth.GateCookie); err == nil && sessions.VerifyGate(c.Value, entry.Host) {
+	if visitorCredential(sessions, entry, grouped, r)&gateCredentialCookie != 0 {
 		http.Redirect(w, r, r.URL.Path, http.StatusSeeOther)
 		return
 	}
 	renderGate(w, entry.Host, false)
+}
+
+func stripGateCookies(header http.Header) {
+	lines := header.Values("Cookie")
+	header.Del("Cookie")
+	for _, line := range lines {
+		kept := make([]string, 0, strings.Count(line, ";")+1)
+		for _, part := range strings.Split(line, ";") {
+			part = strings.TrimSpace(part)
+			name, _, ok := strings.Cut(part, "=")
+			if ok && auth.IsGateCookieName(strings.TrimSpace(name)) {
+				continue
+			}
+			if part != "" {
+				kept = append(kept, part)
+			}
+		}
+		if len(kept) != 0 {
+			header.Add("Cookie", strings.Join(kept, "; "))
+		}
+	}
+}
+
+func removeQueryParam(rawQuery, target string) string {
+	parts := strings.Split(rawQuery, "&")
+	kept := parts[:0]
+	for _, part := range parts {
+		key, _, _ := strings.Cut(part, "=")
+		decoded, err := url.QueryUnescape(key)
+		if err == nil && decoded == target {
+			continue
+		}
+		kept = append(kept, part)
+	}
+	return strings.Join(kept, "&")
 }
 
 func stripPort(host string) string {

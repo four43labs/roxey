@@ -122,6 +122,8 @@ environments:
 ```bash
 roxey up      # foreground: interleaved [name] logs, Ctrl-C tears down everything
 roxey up -d   # detached: prints a URL table, logs via `roxey logs <name>`
+roxey up --online                 # temporarily use ROXEY_DOMAIN or f43.run
+roxey up --online --protect pass  # one unlock grants access to every host
 roxey down    # stop this manifest's tunnels and spawned services
 ```
 
@@ -129,6 +131,15 @@ Spawned services receive `PORT`, `HOST=127.0.0.1`, and their `environment`
 map. `up` waits until each port accepts connections before opening its
 tunnel, and re-running it restarts the manifest's services and tunnels from
 a clean slate — a crashed run can never leave orphans behind.
+
+`--online` overrides the manifest relay for that run with the hosted relay
+(`ROXEY_DOMAIN`, default `f43.run`) without creating or changing a manifest.
+If a local manifest uses dotted hosts such as `app.verifycate`, Roxey
+automatically applies a stable checkout preview slug so the hosted service
+names remain valid single DNS labels. `--protect <secret>` (or
+`--protect=<secret>`) overrides protection on every environment; all hosts in
+that `up` share one unlock gate. Ad-hoc `roxey start --protect` remains scoped
+to that one host.
 
 ### Local development domains: `local` relay mode
 
@@ -140,7 +151,7 @@ relay_server:
   # tld: mycompany.dev  # ...but ANY domain works
 ```
 
-On first `up`, roxey downloads the relay binary, generates a local CA, asks once for sudo to trust it and bind port 443, creates its own API key, and starts the relay. You then browse your project's URLs with no cert warnings and no manual setup.
+On first `up`, roxey downloads the relay binary, generates a local CA, asks once for sudo to trust it and bind port 443, creates its own API key, and starts the relay. Host-file synchronization is idempotent, so unchanged hosts do not prompt for sudo again. You then browse your project's URLs with no cert warnings and no manual setup.
 
 **One relay serves all your projects.** The default TLD is `dev`, and every project namespaces its hosts under its own name:
 
@@ -199,7 +210,7 @@ Status is always derived live — the registry stores only identity (name, path,
 
 ### Fork previews for git worktrees (AI-agent friendly)
 
-Run `roxey up` inside a linked git worktree and roxey automatically creates an *isolated preview*: environment hosts get the branch slug as prefix, services get fresh auto-assigned ports, and everything registers as its own project.
+Run `roxey up` inside a linked git worktree and roxey automatically creates an *isolated preview*: environment hosts get the branch slug as prefix, every spawned route gets a distinct fresh port, localhost proxy aliases are remapped with it, and everything registers as its own project. Detached worktrees include a stable path discriminator, so two worktrees at the same commit still get different preview names.
 
 ```bash
 cd ~/projects/netflix.worktrees/fix-13-auth   # a git worktree
@@ -217,9 +228,16 @@ To keep forks pointing at *their own* services instead of the main checkout's, r
 ```yaml
 environment:
   NEXT_PUBLIC_API_URL: https://{{host:api.netflix}}/api/v1
+  API_PORT: "{{port:api.netflix}}"
+  ONLINE: "{{online}}"
   # → resolves to https://fix-13-api-netflix.dev/api/v1 in the fork,
   #   https://api.netflix.dev on the main checkout — same yaml file everywhere
 ```
+
+`{{port:host}}` resolves to that declared host's spawned `/` route after
+preview port allocation. `{{online}}` is `1` under `--online` and empty
+otherwise. On hosted relays, `{{host:host}}` uses the relay's actual assigned
+hostname, including its account suffix.
 
 Note: stateful dependencies stay shared — a preview talks to the same Postgres unless you give it its own.
 Everything binds to loopback only — nothing is reachable from other machines unless you also point a remote relay at them.
@@ -230,10 +248,12 @@ Everything binds to loopback only — nothing is reachable from other machines u
 roxey auth [--tld <tld>] [api-key]
   # Save an API key for a relay server (prompts if key omitted)
 
-roxey up [-d] [--preview[=slug]] [--project <name>] [file]
+roxey up [-d] [--preview[=slug]] [--online] [--protect <secret>] [--project <name>] [file]
   # Bring up every environment in a roxey.yaml manifest
   #   -d, --detach     Run detached; print URL table instead of streaming logs
   #   --preview[=slug] Force fork-preview mode (auto-detected in git worktrees)
+  #   --online         Use ROXEY_DOMAIN or f43.run instead of the manifest relay
+  #   --protect secret Protect every environment with one shared unlock gate
   #   --project <name> Run a registered project from any directory
   #   file             Manifest path; defaults to ./roxey.yaml
 

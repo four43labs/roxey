@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -77,5 +78,42 @@ func TestSplitCommand(t *testing.T) {
 	got, err = splitCommand(`echo "a b"c`)
 	if err != nil || fmt.Sprint(got) != `[echo a bc]` {
 		t.Fatalf("concatenation: %q %v", got, err)
+	}
+}
+
+func TestReclaimPort(t *testing.T) {
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 not available")
+	}
+
+	port := 59876
+	cmd := exec.Command(python, "-m", "http.server", fmt.Sprint(port), "--bind", "127.0.0.1")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start listener: %v", err)
+	}
+	defer cmd.Process.Kill()
+
+	if err := WaitPort(port, 5*timeSecond); err != nil {
+		t.Fatalf("listener did not come up: %v", err)
+	}
+	if listeners := PortListeners(port); len(listeners) == 0 {
+		t.Fatal("expected PortListeners to find the listener")
+	}
+
+	reclaimed := ReclaimPort(port)
+	if len(reclaimed) == 0 {
+		t.Fatal("expected ReclaimPort to report reclaimed PIDs")
+	}
+
+	deadline := time.Now().Add(3 * timeSecond)
+	for time.Now().Before(deadline) {
+		if len(PortListeners(port)) == 0 {
+			return // freed
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if listeners := PortListeners(port); len(listeners) > 0 {
+		t.Fatalf("port %d still held by %v after reclaim", port, listeners)
 	}
 }

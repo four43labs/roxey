@@ -20,6 +20,7 @@ type Entry struct {
 	Service     string // requested service name
 	Host        string // full public host this tunnel answers on
 	UserID      string // owning account
+	GateGroup   string // shared hosted-preview gate; "" = host-scoped
 	ProtectHash string // sha256 of the shared secret when gated; "" = public
 	ConnectedAt time.Time
 	Remote      string
@@ -107,6 +108,7 @@ func (r *Registry) Register(entry *Entry, pathPrefix string, sess *yamux.Session
 	e.Service = entry.Service
 	e.Host = entry.Host
 	e.UserID = entry.UserID
+	e.GateGroup = entry.GateGroup
 	e.ProtectHash = entry.ProtectHash
 
 	if pathPrefix == "" {
