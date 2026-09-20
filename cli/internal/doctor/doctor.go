@@ -17,8 +17,10 @@ import (
 	"time"
 
 	"roxey/internal/config"
+	"roxey/internal/helper"
 	"roxey/internal/localca"
 	"roxey/internal/localrelay"
+	"roxey/internal/service"
 )
 
 type Status int
@@ -208,6 +210,21 @@ func CheckHostsBlock(r *Report, tld string) {
 	if missing == 0 {
 		r.OKf("/etc/hosts managed block present for %s", tld)
 	}
+}
+
+// CheckHelper validates the privileged helper daemon and its socket.
+func CheckHelper(r *Report) {
+	if helper.Available() {
+		r.OKf("privileged helper reachable (prompt-free local mode)")
+		return
+	}
+	if service.DaemonRunning() {
+		r.Failf("restart it (`roxey service install`, or reboot) — see ~/.roxey/logs/daemon.log",
+			"helper daemon is loaded but its socket is unreachable")
+		return
+	}
+	r.Warnf("privileged helper not installed; local mode will prompt for sudo")
+	r.Results[len(r.Results)-1].Fix = "run `roxey setup` once to install it (no more prompts after)"
 }
 
 // ── remote relays ────────────────────────────────────────────────────────

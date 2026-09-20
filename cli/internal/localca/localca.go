@@ -204,37 +204,48 @@ func Trusted(caPath string) bool {
 	return err == nil
 }
 
-// TrustCA installs the CA into the system trust store (sudo-elevated).
+// TrustCA installs the CA into the system trust store. It runs the command
+// directly when already root (the helper daemon) and elevates with sudo
+// otherwise.
 func TrustCA(caPath string) error {
 	switch runtime.GOOS {
 	case "darwin":
-		cmd := exec.Command("sudo", "-p", "roxey needs admin rights to trust its local CA: ",
-			"security", "add-trusted-cert", "-d", "-r", "trustRoot",
+		return runTrust("security", "add-trusted-cert", "-d", "-r", "trustRoot",
 			"-k", "/Library/Keychains/System.keychain", caPath)
-		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-		return cmd.Run()
 	case "linux":
 		if _, err := os.Stat("/usr/bin/update-ca-certificates"); err == nil {
 			dst := "/usr/local/share/ca-certificates/roxey-local-ca.crt"
-			if out, err := exec.Command("sudo", "cp", caPath, dst).CombinedOutput(); err != nil {
-				return fmt.Errorf("copy CA: %v: %s", err, out)
+			if err := runTrust("cp", caPath, dst); err != nil {
+				return fmt.Errorf("copy CA: %w", err)
 			}
-			if out, err := exec.Command("sudo", "update-ca-certificates").CombinedOutput(); err != nil {
-				return fmt.Errorf("update-ca-certificates: %v: %s", err, out)
+			if err := runTrust("update-ca-certificates"); err != nil {
+				return fmt.Errorf("update-ca-certificates: %w", err)
 			}
 			return nil
 		}
 		dst := "/etc/pki/ca-trust/source/anchors/roxey-local-ca.crt"
-		if out, err := exec.Command("sudo", "cp", caPath, dst).CombinedOutput(); err != nil {
-			return fmt.Errorf("copy CA: %v: %s", err, out)
+		if err := runTrust("cp", caPath, dst); err != nil {
+			return fmt.Errorf("copy CA: %w", err)
 		}
-		if out, err := exec.Command("sudo", "update-ca-trust", "extract").CombinedOutput(); err != nil {
-			return fmt.Errorf("update-ca-trust: %v: %s", err, out)
+		if err := runTrust("update-ca-trust", "extract"); err != nil {
+			return fmt.Errorf("update-ca-trust: %w", err)
 		}
 		return nil
 	default:
 		return fmt.Errorf("unsupported OS %s: add %s to your trust store manually", runtime.GOOS, caPath)
 	}
+}
+
+// runTrust executes a trust-store command, prepending sudo only when not root.
+func runTrust(name string, args ...string) error {
+	if os.Geteuid() == 0 {
+		cmd := exec.Command(name, args...)
+		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+		return cmd.Run()
+	}
+	cmd := exec.Command("sudo", append([]string{"-p", "roxey needs admin rights to trust its local CA: ", name}, args...)...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	return cmd.Run()
 }
 
 func dnsNames(hosts []string) []string {

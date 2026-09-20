@@ -35,18 +35,32 @@ func HostsEntries(tld string, envHosts []string) []string {
 	return out
 }
 
+// RenderBlock returns the managed /etc/hosts block for entries, or "" when
+// there is nothing to claim. It is pure so the privileged helper daemon can
+// rebuild the block server-side from validated entries.
+func RenderBlock(entries []string) string {
+	if len(entries) == 0 {
+		return ""
+	}
+	return hostsBegin + "\n127.0.0.1 " + strings.Join(entries, " ") + "\n" + hostsEnd + "\n"
+}
+
 // SyncHosts replaces the managed roxey block in /etc/hosts with entries
 // (sudo-elevated). No-op for .localhost TLDs.
 func SyncHosts(entries []string) error {
 	if len(entries) == 0 {
 		return nil
 	}
-	newBlock := hostsBegin + "\n127.0.0.1 " + strings.Join(entries, " ") + "\n" + hostsEnd + "\n"
-	return writeHosts(newBlock)
+	return writeHosts(RenderBlock(entries))
 }
 
 // RemoveHosts drops the managed block from /etc/hosts.
 func RemoveHosts() error { return writeHosts("") }
+
+// WriteManagedBlock replaces the managed roxey block in /etc/hosts with block
+// (which must come from RenderBlock). When running as root (the helper daemon)
+// it writes directly; otherwise it elevates with sudo.
+func WriteManagedBlock(block string) error { return writeHosts(block) }
 
 func writeHosts(newBlock string) error {
 	data, err := os.ReadFile("/etc/hosts")
@@ -56,6 +70,10 @@ func writeHosts(newBlock string) error {
 	content := mergeHostsBlock(string(data), newBlock)
 	if content == string(data) {
 		return nil
+	}
+
+	if os.Geteuid() == 0 {
+		return writeHostsRoot(content)
 	}
 
 	tmp, err := os.CreateTemp("", "roxey-hosts-*")
@@ -77,6 +95,29 @@ func writeHosts(newBlock string) error {
 		return fmt.Errorf("update /etc/hosts: %v: %s", err, out)
 	}
 	return nil
+}
+
+// writeHostsRoot atomically replaces /etc/hosts as root via a same-directory
+// temp file, so an interrupted write can never truncate it.
+func writeHostsRoot(content string) error {
+	tmp, err := os.CreateTemp("/etc", "roxey-hosts-*")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	defer os.Remove(name)
+	if _, err := tmp.WriteString(content); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(0644); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(name, "/etc/hosts")
 }
 
 func mergeHostsBlock(existing, newBlock string) string {

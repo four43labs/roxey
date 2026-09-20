@@ -11,12 +11,36 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"roxey/internal/localrelay"
 )
 
 const (
-	darwinLabel     = "com.four43labs.roxey-relay"
+	darwinDaemonLabel = "com.four43labs.roxey-daemon"
+	linuxDaemonUnit   = "roxey-daemon.service"
+
+	// Legacy relay-only unit, replaced by the combined privileged daemon.
+	legacyDarwinLabel = "com.four43labs.roxey-relay"
+	legacyLinuxUnit   = "roxey-relay.service"
+
 	projectLabelPfx = "com.four43labs.roxey.project."
 )
+
+// RootDir is where root-owned copies of roxey's binaries live, so a
+// user-writable Homebrew/path binary can never be executed as root.
+func RootDir() string {
+	switch runtime.GOOS {
+	case "darwin":
+		return "/Library/Application Support/roxey"
+	case "linux":
+		return "/usr/local/libexec/roxey"
+	default:
+		return ""
+	}
+}
+
+// RootBinary returns the root-owned path of a named binary.
+func RootBinary(name string) string { return filepath.Join(RootDir(), name) }
 
 type Manager struct {
 	BinPath  string // absolute path to the roxey binary
@@ -47,49 +71,88 @@ func stateDirForUser() string {
 	return filepath.Join(strings.TrimSpace(string(out)), ".roxey")
 }
 
-// ── relay daemon ─────────────────────────────────────────────────────────
+// ── privileged helper daemon ─────────────────────────────────────────────
 
-// InstallRelay writes and enables the boot-time relay unit (sudo-elevated).
-func (m *Manager) InstallRelay() error {
+// InstallDaemon installs the boot-time privileged helper (sudo-elevated):
+// it owns /etc/hosts, CA trust, and the port-443 relay, and serves the
+// unprivileged CLI over a Unix socket. relayBin, when set, is copied to a
+// root-owned path the daemon executes.
+func (m *Manager) InstallDaemon(relayBin string) error {
+	if err := m.installRootBinaries(relayBin); err != nil {
+		return err
+	}
 	switch runtime.GOOS {
 	case "darwin":
-		return m.darwinInstallRelay()
+		return m.darwinInstallDaemon()
 	case "linux":
-		return m.linuxInstallRelay()
+		return m.linuxInstallDaemon()
 	default:
 		return fmt.Errorf("service install is not supported on %s", runtime.GOOS)
 	}
 }
 
-func (m *Manager) UninstallRelay() error {
+// installRootBinaries copies the CLI and relay into a root-owned directory so
+// the daemon never execs a user-writable binary as root.
+func (m *Manager) installRootBinaries(relayBin string) error {
+	if err := sudo("mkdir", "-p", RootDir()); err != nil {
+		return err
+	}
+	if err := sudo("cp", m.BinPath, RootBinary("roxey")); err != nil {
+		return err
+	}
+	if err := sudo("chmod", "0755", RootBinary("roxey")); err != nil {
+		return err
+	}
+	if relayBin == "" {
+		p, err := localrelay.EnsureBinary()
+		if err != nil {
+			return fmt.Errorf("relay binary: %w", err)
+		}
+		relayBin = p
+	}
+	if err := sudo("cp", relayBin, RootBinary("roxey-relay")); err != nil {
+		return err
+	}
+	return sudo("chmod", "0755", RootBinary("roxey-relay"))
+}
+
+func (m *Manager) UninstallDaemon() error {
 	switch runtime.GOOS {
 	case "darwin":
-		_ = exec.Command("launchctl", "bootout", "system", darwinLabel).Run()
-		return sudo("rm", "-f", "/Library/LaunchDaemons/"+darwinLabel+".plist")
+		_ = exec.Command("launchctl", "bootout", "system", darwinDaemonLabel).Run()
+		_ = exec.Command("launchctl", "bootout", "system", legacyDarwinLabel).Run()
+		_ = sudo("rm", "-f", "/Library/LaunchDaemons/"+darwinDaemonLabel+".plist")
+		_ = sudo("rm", "-f", "/Library/LaunchDaemons/"+legacyDarwinLabel+".plist")
+		_ = sudo("rm", "-rf", RootDir())
+		return nil
 	case "linux":
-		_ = exec.Command("sudo", "systemctl", "disable", "--now", "roxey-relay").Run()
-		return sudo("rm", "-f", "/etc/systemd/system/roxey-relay.service")
+		_ = exec.Command("sudo", "systemctl", "disable", "--now", linuxDaemonUnit).Run()
+		_ = exec.Command("sudo", "systemctl", "disable", "--now", legacyLinuxUnit).Run()
+		_ = sudo("rm", "-f", "/etc/systemd/system/"+linuxDaemonUnit)
+		_ = sudo("rm", "-f", "/etc/systemd/system/"+legacyLinuxUnit)
+		_ = sudo("systemctl", "daemon-reload")
+		_ = sudo("rm", "-rf", RootDir())
+		return nil
 	default:
 		return fmt.Errorf("not supported on %s", runtime.GOOS)
 	}
 }
 
-// RelayRunning reports whether the boot daemon's process is loaded/active.
-func RelayRunning() bool {
+// DaemonRunning reports whether the boot helper's process is loaded/active.
+func DaemonRunning() bool {
 	switch runtime.GOOS {
 	case "darwin":
-		out, err := exec.Command("launchctl", "print", "system/"+darwinLabel).CombinedOutput()
+		out, err := exec.Command("launchctl", "print", "system/"+darwinDaemonLabel).CombinedOutput()
 		return err == nil && strings.Contains(string(out), "state")
 	case "linux":
-		err := exec.Command("systemctl", "is-active", "--quiet", "roxey-relay").Run()
-		return err == nil
+		return exec.Command("systemctl", "is-active", "--quiet", linuxDaemonUnit).Run() == nil
 	default:
 		return false
 	}
 }
 
-func (m *Manager) darwinInstallRelay() error {
-	logs := filepath.Join(m.StateDir, "logs", "relay-service.log")
+func (m *Manager) darwinInstallDaemon() error {
+	logs := filepath.Join(m.StateDir, "logs", "daemon.log")
 	plist := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -98,7 +161,7 @@ func (m *Manager) darwinInstallRelay() error {
   <key>ProgramArguments</key>
   <array>
     <string>%s</string>
-    <string>_service-relay</string>
+    <string>_daemon</string>
     <string>--state-dir</string>
     <string>%s</string>
   </array>
@@ -109,9 +172,9 @@ func (m *Manager) darwinInstallRelay() error {
   <key>StandardErrorPath</key><string>%s</string>
 </dict>
 </plist>
-`, darwinLabel, m.BinPath, m.StateDir, logs, logs)
+`, darwinDaemonLabel, RootBinary("roxey"), m.StateDir, logs, logs)
 
-	tmp, err := os.CreateTemp("", "roxey-relay-*.plist")
+	tmp, err := os.CreateTemp("", "roxey-daemon-*.plist")
 	if err != nil {
 		return err
 	}
@@ -122,8 +185,11 @@ func (m *Manager) darwinInstallRelay() error {
 	}
 	tmp.Close()
 
-	dst := "/Library/LaunchDaemons/" + darwinLabel + ".plist"
-	_ = exec.Command("launchctl", "bootout", "system", darwinLabel).Run()
+	dst := "/Library/LaunchDaemons/" + darwinDaemonLabel + ".plist"
+	// Retire any legacy relay-only unit before installing the daemon.
+	_ = exec.Command("launchctl", "bootout", "system", legacyDarwinLabel).Run()
+	_ = sudo("rm", "-f", "/Library/LaunchDaemons/"+legacyDarwinLabel+".plist")
+	_ = exec.Command("launchctl", "bootout", "system", darwinDaemonLabel).Run()
 	if err := sudo("cp", tmp.Name(), dst); err != nil {
 		return err
 	}
@@ -133,22 +199,22 @@ func (m *Manager) darwinInstallRelay() error {
 	return sudo("launchctl", "bootstrap", "system", dst)
 }
 
-func (m *Manager) linuxInstallRelay() error {
+func (m *Manager) linuxInstallDaemon() error {
 	unit := fmt.Sprintf(`[Unit]
-Description=Roxey local relay
+Description=Roxey privileged helper (local relay, /etc/hosts, CA trust)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=%s _service-relay --state-dir %s
+ExecStart=%s _daemon --state-dir %s
 Restart=always
 User=root
 
 [Install]
 WantedBy=multi-user.target
-`, m.BinPath, m.StateDir)
+`, RootBinary("roxey"), m.StateDir)
 
-	tmp, err := os.CreateTemp("", "roxey-relay-*.service")
+	tmp, err := os.CreateTemp("", "roxey-daemon-*.service")
 	if err != nil {
 		return err
 	}
@@ -159,13 +225,15 @@ WantedBy=multi-user.target
 	}
 	tmp.Close()
 
-	dst := "/etc/systemd/system/roxey-relay.service"
+	dst := "/etc/systemd/system/" + linuxDaemonUnit
+	_ = exec.Command("sudo", "systemctl", "disable", "--now", legacyLinuxUnit).Run()
+	_ = sudo("rm", "-f", "/etc/systemd/system/"+legacyLinuxUnit)
 	if err := sudo("cp", tmp.Name(), dst); err != nil {
 		return err
 	}
 	for _, c := range [][]string{
 		{"sudo", "systemctl", "daemon-reload"},
-		{"sudo", "systemctl", "enable", "--now", "roxey-relay"},
+		{"sudo", "systemctl", "enable", "--now", linuxDaemonUnit},
 	} {
 		cmd := exec.Command(c[0], c[1:]...)
 		cmd.Stdin = os.Stdin

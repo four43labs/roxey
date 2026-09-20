@@ -11,7 +11,7 @@ It is designed for the messy reality of modern local development: a frontend, a 
 - **Local relay mode** — run the relay backend on your own machine for instant `.localhost` HTTPS domains, complete with automatic CA generation and trust-store installation
 - **Everything streams** — tunnels are raw TCP pipes, so WebSockets, SSE, HMR, and large uploads just work
 - **Self-hostable** — use the hosted relay at `roxey.f43.run`, or deploy your own with a single Docker image
-- **Boot-time daemon** — install the local relay as a system service that survives reboots, with per-project autostart
+- **Privileged helper daemon** — one-time setup installs a boot helper that owns the relay, `/etc/hosts`, and CA trust, so local mode never asks for sudo again (agent-friendly), with per-project autostart
 
 ## Getting Started
 
@@ -151,7 +151,20 @@ relay_server:
   # tld: mycompany.dev  # ...but ANY domain works
 ```
 
-On first `up`, roxey downloads the relay binary, generates a local CA, asks once for sudo to trust it and bind port 443, creates its own API key, and starts the relay. Host-file synchronization is idempotent, so unchanged hosts do not prompt for sudo again. You then browse your project's URLs with no cert warnings and no manual setup.
+On first `up`, roxey downloads the relay binary, generates a local CA, and —
+after a **single one-time admin prompt** — installs a small privileged helper
+daemon. That daemon owns the three root-only jobs (trusting the CA, syncing
+the managed `/etc/hosts` block, and running the relay on port 443) and serves
+the CLI over `~/.roxey/helper.sock`. Every subsequent `up`, `down`, worktree
+preview, and agent run needs **no sudo at all**. Host-file synchronization is
+idempotent and selective: only the hostnames roxey is actually serving are
+mapped to loopback, so public sites under the same TLD (e.g. real `.dev`
+domains) keep resolving normally. You then browse your project's URLs with no
+cert warnings and no manual setup.
+
+Prefer to install it up front? Run `roxey setup` once. It also runs
+automatically on the first local `up` when run from a terminal; non-interactive
+callers (agents, CI) get a clear hint to run it once instead of a hung prompt.
 
 **One relay serves all your projects.** The default TLD is `dev`, and every project namespaces its hosts under its own name:
 
@@ -176,21 +189,27 @@ Any explicit `tld:` is still honored (`tld: localhost` for native-resolving name
 
 - OAuth callbacks work as-is under a custom TLD: register the callback URL once and it works across every branch.
 - Give each service its own host (`api.*`, `admin.*`) rather than path prefixes when apps hard-code origins or cookies.
-- The relay keeps running after `roxey down` so subsequent `up`s are instant; stop it manually with `pkill roxey-relay` — or install it as a boot daemon (below).
+- The relay keeps running after `roxey down` so subsequent `up`s are instant; stop it manually with `pkill roxey-relay` — or install the boot helper (`roxey setup`) so it survives reboots and never prompts for sudo again.
 
 ### Boot-time service (Docker Desktop-style)
 
-Keep the local relay alive across reboots, and optionally bring projects up at login:
+Keep the privileged helper (and the local relay it supervises) alive across
+reboots, and optionally bring projects up at login:
 
 ```bash
-roxey service install                  # relay daemon: starts at boot, restarts on crash
+roxey setup                            # one-time: install the helper (single sudo)
+roxey service install                  # same helper, install/enable it explicitly
 roxey projects --autostart netflix  # also bring this project up at login
 roxey projects --autostart-off netflix
-roxey service status                   # daemon state + autostart list
+roxey service status                   # helper + socket + relay state, autostart list
 roxey service uninstall                # remove everything
 ```
 
-macOS uses a root LaunchDaemon (`KeepAlive`) plus per-project user LaunchAgents; Linux uses systemd system/user units. The daemon replays the same commands you would run by hand — nothing about your manifests changes.
+macOS uses a root LaunchDaemon (`KeepAlive`) plus per-project user LaunchAgents;
+Linux uses systemd system/user units. The daemon replays the same commands you
+would run by hand — nothing about your manifests changes. Roxey installs
+root-owned copies of its binaries so a user-writable Homebrew binary is never
+executed as root.
 
 ### Multiple projects from anywhere
 
@@ -279,8 +298,12 @@ roxey list
   # List live tunnels and spawned services on this machine
 
 roxey service install|uninstall|status
-  # Manage the boot-time relay daemon (launchd/systemd); status shows
-  # daemon state and which projects have autostart enabled
+  # Manage the boot-time privileged helper (launchd/systemd); status shows
+  # helper/socket/relay state and which projects have autostart enabled
+
+roxey setup
+  # One-time: install the privileged helper (single admin prompt). After
+  # this, local mode runs with no sudo prompts — safe for agents.
 ```
 
 Environment variables:
@@ -395,7 +418,8 @@ Releases are tagged `vX.Y.Z`; a single tag publishes the Docker image, both bina
 - macOS or Linux (Windows builds are not published yet)
 - Node.js ≥ 18 for the npm installer, or use a prebuilt binary
 - Go ≥ 1.24 only if building from source
-- For local relay mode: sudo access (first run only, to trust the CA and bind port 443)
+- For local relay mode: one-time admin access to install the privileged
+  helper (`roxey setup`); no sudo prompts afterwards
 
 ## License
 

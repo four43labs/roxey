@@ -19,8 +19,11 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/term"
+
 	"roxey/internal/config"
 	"roxey/internal/doctor"
+	"roxey/internal/helper"
 	"roxey/internal/localca"
 	"roxey/internal/localrelay"
 	"roxey/internal/manifest"
@@ -69,8 +72,14 @@ func main() {
 		err = cmdDoctor(os.Args[2:])
 	case "service":
 		err = cmdService(os.Args[2:])
-	case "_service-relay": // internal: boot-time relay entrypoint (runs as root)
+	case "setup":
+		err = cmdSetup(os.Args[2:])
+	case "_service-relay": // internal: legacy boot-time relay entrypoint (runs as root)
 		err = cmdServiceRelay(os.Args[2:])
+	case "_daemon": // internal: privileged helper daemon (runs as root)
+		err = cmdDaemon(os.Args[2:])
+	case "_install-daemon": // internal: install the helper daemon (runs via sudo)
+		err = cmdInstallDaemon(os.Args[2:])
 	case "_run": // internal: background tunnel worker
 		err = cmdRun(os.Args[2:])
 	default:
@@ -92,7 +101,9 @@ Commands:
                                       Bring up a manifest's environments
   down [file]                         Tear down a manifest's tunnels + services
   projects [--forget n] [--prune]     List known projects and their status
-  service install|uninstall|status    Manage the boot-time relay daemon
+  service install|uninstall|status    Manage the boot-time privileged helper
+  setup                               One-time: install the helper (single sudo),
+                                      then local mode never prompts again
   logs <name>                         Tail a service started by ` + "`up -d`" + `
   doctor [roxey.yaml]                 Diagnose state, relays, certs, and ports
   start <service>[/path/*] <target>   Ad-hoc tunnel, e.g. roxey start myapp localhost:3000
@@ -786,6 +797,10 @@ func teardownManifest(manifestPath string) error {
 // local relay is running with an API key saved. Cert SANs and the
 // /etc/hosts block cover every registered local project (cumulative), so
 // bringing one project up never breaks another's URLs.
+//
+// Privileged steps go through the helper daemon when installed (no prompts);
+// otherwise a first interactive run auto-installs it, with a plain sudo
+// fallback.
 func ensureLocalRelay(m *manifest.Manifest, reg *projects.Registry) error {
 	tld := m.RelayServer.TLD
 
@@ -799,24 +814,14 @@ func ensureLocalRelay(m *manifest.Manifest, reg *projects.Registry) error {
 	}
 	hosts = dedupe(hosts)
 
+	// Certificates are unprivileged (the relay reloads them on change), so
+	// always provision them as the invoking user.
 	res, err := localca.Ensure(hosts)
 	if err != nil {
 		return fmt.Errorf("local certs: %w", err)
 	}
-	if !localca.Trusted(res.CAPath) {
-		fmt.Println("[certs] trusting local CA (may ask for your password)...")
-		if err := localca.TrustCA(res.CAPath); err != nil {
-			return err
-		}
-	}
 
-	if localrelay.NeedsHosts(tld) {
-		if err := localrelay.SyncHosts(hosts); err != nil {
-			return fmt.Errorf("/etc/hosts sync: %w", err)
-		}
-	}
-
-	if err := localrelay.EnsureRunning(tld); err != nil {
+	if err := applyLocalPrivileged(tld, hosts, res.CAPath); err != nil {
 		return err
 	}
 
@@ -834,6 +839,121 @@ func ensureLocalRelay(m *manifest.Manifest, reg *projects.Registry) error {
 	}
 	m.RelayServer.APIKey = sc.APIKey
 	return nil
+}
+
+// applyLocalPrivileged trusts the CA, syncs /etc/hosts, and ensures the relay
+// is running — via the helper daemon, auto-installing it once when
+// interactive, or falling back to interactive sudo.
+func applyLocalPrivileged(tld string, hosts []string, caPath string) error {
+	if helper.Available() {
+		return applyViaHelper(tld, hosts, caPath)
+	}
+
+	if interactive() {
+		fmt.Println("[setup] installing the roxey helper (one-time admin prompt; no more sudo after this)...")
+		if err := installDaemon(); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: helper install failed: %v\n", err)
+		} else if waitHelper(15 * time.Second) {
+			return applyViaHelper(tld, hosts, caPath)
+		} else {
+			fmt.Fprintln(os.Stderr, "warning: helper did not start")
+		}
+		fmt.Println("[setup] continuing with one-off sudo; run `roxey setup` to make this prompt-free")
+	} else {
+		fmt.Fprintln(os.Stderr, "hint: run `roxey setup` once (as this user) to make local mode prompt-free for agents")
+	}
+
+	return applyViaSudo(tld, hosts, caPath)
+}
+
+func applyViaHelper(tld string, hosts []string, caPath string) error {
+	if !localca.Trusted(caPath) {
+		fmt.Println("[certs] trusting local CA...")
+		if err := helper.TrustCA(); err != nil {
+			return err
+		}
+	}
+	if localrelay.NeedsHosts(tld) {
+		if err := helper.SyncHosts(hosts); err != nil {
+			return fmt.Errorf("helper /etc/hosts sync: %w", err)
+		}
+	}
+	// Hosts sync already starts the relay; ensure it explicitly too for
+	// .localhost TLDs where no hosts entry is needed.
+	if err := helper.EnsureRelay(); err != nil {
+		return err
+	}
+	if err := waitRelay(tld, 30*time.Second); err != nil {
+		return err
+	}
+	return nil
+}
+
+func applyViaSudo(tld string, hosts []string, caPath string) error {
+	if !localca.Trusted(caPath) {
+		fmt.Println("[certs] trusting local CA (may ask for your password)...")
+		if err := localca.TrustCA(caPath); err != nil {
+			return err
+		}
+	}
+	if localrelay.NeedsHosts(tld) {
+		if err := localrelay.SyncHosts(hosts); err != nil {
+			return fmt.Errorf("/etc/hosts sync: %w", err)
+		}
+	}
+	return localrelay.EnsureRunning(tld)
+}
+
+// syncHostsAny applies the /etc/hosts block via the daemon when available,
+// else the interactive sudo path.
+func syncHostsAny(hosts []string) error {
+	if helper.Available() {
+		return helper.SyncHosts(hosts)
+	}
+	return localrelay.SyncHosts(hosts)
+}
+
+// interactive reports whether stdin is a terminal (agents are not).
+func interactive() bool {
+	return term.IsTerminal(int(os.Stdin.Fd()))
+}
+
+// installDaemon elevates once to install the privileged helper.
+func installDaemon() error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	relayBin, err := localrelay.EnsureBinary()
+	if err != nil {
+		return fmt.Errorf("relay binary: %w", err)
+	}
+	cmd := exec.Command("sudo", "-p", "roxey needs one-time admin access to install its helper: ",
+		exe, "_install-daemon", "--state-dir", config.Dir(), "--relay-bin", relayBin)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	return cmd.Run()
+}
+
+func waitHelper(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if helper.Available() {
+			return true
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	return false
+}
+
+func waitRelay(tld string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if localrelay.HealthOK(tld) {
+			return nil
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	return fmt.Errorf("local relay did not become healthy within %s", timeout)
 }
 
 func dedupe(in []string) []string {
@@ -942,7 +1062,7 @@ func cmdDown(args []string) error {
 		}
 	}
 	if m.RelayServer.Local && localrelay.NeedsHosts(tld) {
-		if err := localrelay.SyncHosts(reg.AllLocalHostFQDNs()); err != nil {
+		if err := syncHostsAny(reg.AllLocalHostFQDNs()); err != nil {
 			fmt.Fprintln(os.Stderr, "warning: could not update /etc/hosts:", err)
 		}
 	}
@@ -1007,6 +1127,7 @@ func cmdDoctor(args []string) error {
 
 	rep := &doctor.Report{}
 	doctor.CheckState(rep)
+	doctor.CheckHelper(rep)
 
 	// Relay checks for every registered TLD; remember which were covered so
 	// the manifest section doesn't duplicate them.
@@ -1031,7 +1152,8 @@ func cmdDoctor(args []string) error {
 	// Boot-service status.
 	if runtime.GOOS == "darwin" || runtime.GOOS == "linux" {
 		fmt.Printf("service:\n")
-		fmt.Printf("  relay daemon:  %s\n", onOff(service.RelayRunning()))
+		fmt.Printf("  helper daemon: %s\n", onOff(service.DaemonRunning()))
+		fmt.Printf("  helper socket: %s\n", onOff(helper.Available()))
 		reg2, _ := projects.Load()
 		var auto []string
 		for _, n := range reg2.SortedNames() {
@@ -1172,34 +1294,125 @@ func cmdServiceRelay(args []string) error {
 		}
 	}
 
-	sc, _ := config.ServerFor(tld)
-	adminEmail, adminPass := sc.AdminEmail, sc.AdminPass
-	if adminEmail == "" || adminPass == "" {
-		adminEmail, adminPass = localrelay.RandomToken()+"@localhost", localrelay.RandomToken()
-		_ = config.SetServer(tld, config.ServerConfig{
-			Local: true, AdminEmail: adminEmail, AdminPass: adminPass, APIKey: sc.APIKey,
-		})
-	}
-
 	bin, err := localrelay.EnsureBinary()
 	if err != nil {
 		return fmt.Errorf("relay binary: %w", err)
 	}
 
-	certDir := config.CertDir()
-	env := append(os.Environ(),
-		"ROXEY_DOMAIN="+tld,
-		"ROXEY_ADMIN_HOST=roxey."+tld,
-		"ROXEY_SINGLE_USER=1",
-		"ROXEY_ADMIN_EMAIL="+adminEmail,
-		"ROXEY_ADMIN_PASSWORD="+adminPass,
-		"ROXEY_DB_PATH="+filepath.Join(stateDir, "local_"+strings.ReplaceAll(tld, ".", "_")+".db"),
-		"PORT=443",
-		"ROXEY_TLS_CERT="+filepath.Join(certDir, "leaf.crt"),
-		"ROXEY_TLS_KEY="+filepath.Join(certDir, "leaf.key"),
-	)
+	relayEnv, err := localrelay.RelayEnv(tld)
+	if err != nil {
+		return err
+	}
+	env := append(os.Environ(), relayEnv...)
 	fmt.Printf("[service] starting relay for *.%s at roxey.%s\n", tld, tld)
 	return syscall.Exec(bin, []string{bin}, env)
+}
+
+// ── privileged helper daemon ─────────────────────────────────────────────
+
+// cmdDaemon is the privileged helper entrypoint (runs as root under
+// launchd/systemd): it owns /etc/hosts, CA trust, and the port-443 relay,
+// and serves the unprivileged CLI over ~/.roxey/helper.sock.
+func cmdDaemon(args []string) error {
+	stateDir, relayBin := "", ""
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == "--state-dir" && i+1 < len(args):
+			i++
+			stateDir = args[i]
+		case strings.HasPrefix(args[i], "--state-dir="):
+			stateDir = strings.TrimPrefix(args[i], "--state-dir=")
+		case args[i] == "--relay-bin" && i+1 < len(args):
+			i++
+			relayBin = args[i]
+		case strings.HasPrefix(args[i], "--relay-bin="):
+			relayBin = strings.TrimPrefix(args[i], "--relay-bin=")
+		}
+	}
+	if stateDir == "" {
+		return fmt.Errorf("_daemon requires --state-dir")
+	}
+	config.SetDir(stateDir)
+	if relayBin == "" {
+		if p := service.RootBinary("roxey-relay"); fileExists(p) {
+			relayBin = p
+		} else if p, err := localrelay.EnsureBinary(); err == nil {
+			relayBin = p
+		} else {
+			return fmt.Errorf("relay binary: %w", err)
+		}
+	}
+	return helper.RunDaemon(stateDir, relayBin)
+}
+
+// cmdInstallDaemon installs the boot helper (invoked via sudo).
+func cmdInstallDaemon(args []string) error {
+	stateDir, relayBin := "", ""
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == "--state-dir" && i+1 < len(args):
+			i++
+			stateDir = args[i]
+		case strings.HasPrefix(args[i], "--state-dir="):
+			stateDir = strings.TrimPrefix(args[i], "--state-dir=")
+		case args[i] == "--relay-bin" && i+1 < len(args):
+			i++
+			relayBin = args[i]
+		case strings.HasPrefix(args[i], "--relay-bin="):
+			relayBin = strings.TrimPrefix(args[i], "--relay-bin=")
+		}
+	}
+	if stateDir == "" {
+		return fmt.Errorf("_install-daemon requires --state-dir")
+	}
+	config.SetDir(stateDir)
+	mgr, err := service.NewManager()
+	if err != nil {
+		return err
+	}
+	mgr.StateDir = stateDir // honor the explicit dir even without SUDO_USER
+	return mgr.InstallDaemon(relayBin)
+}
+
+// cmdSetup performs the one-time privileged setup: install the helper daemon,
+// then reconcile CA trust and /etc/hosts for every registered local project.
+func cmdSetup(_ []string) error {
+	if !interactive() && !helper.Available() {
+		return fmt.Errorf("`roxey setup` needs an interactive terminal for the one-time admin prompt")
+	}
+	if !helper.Available() {
+		if err := installDaemon(); err != nil {
+			return err
+		}
+		if !waitHelper(15 * time.Second) {
+			return fmt.Errorf("helper daemon did not start; check `roxey service status` and its logs")
+		}
+	}
+
+	reg, err := projects.Load()
+	if err != nil {
+		return err
+	}
+	hosts := reg.AllLocalHostFQDNs()
+	if len(hosts) == 0 {
+		fmt.Println("[setup] helper installed — no local projects registered yet")
+		return nil
+	}
+	tld := reg.PrimaryLocalTLD()
+	res, err := localca.Ensure(hosts)
+	if err != nil {
+		return fmt.Errorf("local certs: %w", err)
+	}
+	if err := applyViaHelper(tld, hosts, res.CAPath); err != nil {
+		return err
+	}
+	fmt.Println("[setup] done — roxey local mode now runs without sudo prompts")
+	return nil
+}
+
+func fileExists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
 }
 
 // primaryLocalTLD picks the TLD the shared relay serves: "dev" when any
@@ -1213,23 +1426,7 @@ func primaryLocalTLD() string {
 }
 
 func primaryLocalTLDFromRegistry(reg *projects.Registry) string {
-	first := ""
-	for _, n := range reg.SortedNames() {
-		p := reg.Projects[n]
-		if !p.Local {
-			continue
-		}
-		if p.TLD == manifest.DefaultLocalTLD {
-			return p.TLD
-		}
-		if first == "" {
-			first = p.TLD
-		}
-	}
-	if first != "" {
-		return first
-	}
-	return manifest.DefaultLocalTLD
+	return reg.PrimaryLocalTLD()
 }
 
 func onOff(b bool) string {
@@ -1254,10 +1451,14 @@ func cmdService(args []string) error {
 		if err != nil {
 			return err
 		}
-		if err := mgr.InstallRelay(); err != nil {
-			return fmt.Errorf("install relay daemon: %w", err)
+		relayBin, err := localrelay.EnsureBinary()
+		if err != nil {
+			return fmt.Errorf("relay binary: %w", err)
 		}
-		fmt.Println("[service] relay installed (starts at boot, restarts on crash)")
+		if err := mgr.InstallDaemon(relayBin); err != nil {
+			return fmt.Errorf("install helper daemon: %w", err)
+		}
+		fmt.Println("[service] helper installed (owns relay + /etc/hosts + CA; starts at boot)")
 		for _, name := range reg.SortedNames() {
 			p := reg.Projects[name]
 			if p.AutoStart && !p.Preview {
@@ -1277,17 +1478,16 @@ func cmdService(args []string) error {
 				_ = mgr.UninstallProjectAgent(name)
 			}
 		}
-		if err := mgr.UninstallRelay(); err != nil {
+		if err := mgr.UninstallDaemon(); err != nil {
 			return err
 		}
-		fmt.Println("[service] relay daemon removed.")
+		fmt.Println("[service] helper daemon removed.")
 		return nil
 
 	case "status":
-		installed := service.RelayRunning() // loaded implies installed
-		_ = installed
 		tld := primaryLocalTLD()
-		fmt.Printf("relay daemon:  %s\n", onOff(service.RelayRunning()))
+		fmt.Printf("helper daemon: %s\n", onOff(service.DaemonRunning()))
+		fmt.Printf("helper socket: %s\n", onOff(helper.Available()))
 		if localrelay.HealthOK(tld) {
 			fmt.Printf("relay health:  ok (roxey.%s)\n", tld)
 		} else {

@@ -189,6 +189,36 @@ func downloadExtract(url, dstFile string) error {
 	}
 }
 
+// RelayEnv returns the environment for the relay binary serving tld,
+// creating (and persisting) throwaway admin credentials on first use. Shared
+// by the interactive sudo path and the privileged helper daemon.
+func RelayEnv(tld string) ([]string, error) {
+	sc, _ := config.ServerFor(tld)
+	adminEmail, adminPass := sc.AdminEmail, sc.AdminPass
+	if adminEmail == "" || adminPass == "" {
+		adminEmail = RandomToken() + "@localhost"
+		adminPass = RandomToken()
+		if err := config.SetServer(tld, config.ServerConfig{
+			Local: true, AdminEmail: adminEmail, AdminPass: adminPass, APIKey: sc.APIKey,
+		}); err != nil {
+			return nil, err
+		}
+	}
+
+	certDir := config.CertDir()
+	return []string{
+		"ROXEY_DOMAIN=" + tld,
+		"ROXEY_ADMIN_HOST=" + RelayHost(tld),
+		"ROXEY_SINGLE_USER=1",
+		"ROXEY_ADMIN_EMAIL=" + adminEmail,
+		"ROXEY_ADMIN_PASSWORD=" + adminPass,
+		"ROXEY_DB_PATH=" + filepath.Join(config.Dir(), "local_"+strings.ReplaceAll(tld, ".", "_")+".db"),
+		"PORT=" + listenPort,
+		"ROXEY_TLS_CERT=" + filepath.Join(certDir, "leaf.crt"),
+		"ROXEY_TLS_KEY=" + filepath.Join(certDir, "leaf.key"),
+	}, nil
+}
+
 // EnsureRunning starts the relay as root on port 443 if it isn't healthy
 // already, using cert/key files previously written by localca.Ensure.
 func EnsureRunning(tld string) error {
@@ -208,24 +238,9 @@ func EnsureRunning(tld string) error {
 		return fmt.Errorf("fetching relay binary: %w", err)
 	}
 
-	sc, _ := config.ServerFor(tld)
-	adminEmail, adminPass := sc.AdminEmail, sc.AdminPass
-	if adminEmail == "" || adminPass == "" {
-		adminEmail = RandomToken() + "@localhost"
-		adminPass = RandomToken()
-	}
-
-	certDir := config.CertDir()
-	envs := []string{
-		"ROXEY_DOMAIN=" + tld,
-		"ROXEY_ADMIN_HOST=" + RelayHost(tld),
-		"ROXEY_SINGLE_USER=1",
-		"ROXEY_ADMIN_EMAIL=" + adminEmail,
-		"ROXEY_ADMIN_PASSWORD=" + adminPass,
-		"ROXEY_DB_PATH=" + filepath.Join(config.Dir(), "local_"+strings.ReplaceAll(tld, ".", "_")+".db"),
-		"PORT=" + listenPort,
-		"ROXEY_TLS_CERT=" + filepath.Join(certDir, "leaf.crt"),
-		"ROXEY_TLS_KEY=" + filepath.Join(certDir, "leaf.key"),
+	envs, err := RelayEnv(tld)
+	if err != nil {
+		return err
 	}
 
 	fmt.Println("[relay] starting local relay (sudo required to bind port 443)...")
@@ -240,11 +255,6 @@ func EnsureRunning(tld string) error {
 	deadline := time.Now().Add(spawnExpiry)
 	for time.Now().Before(deadline) {
 		if HealthOK(tld) {
-			if err := config.SetServer(tld, config.ServerConfig{
-				Local: true, AdminEmail: adminEmail, AdminPass: adminPass, APIKey: sc.APIKey,
-			}); err != nil {
-				return err
-			}
 			return nil
 		}
 		time.Sleep(300 * time.Millisecond)

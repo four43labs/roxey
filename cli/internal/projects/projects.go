@@ -14,6 +14,7 @@ import (
 
 	"roxey/internal/config"
 	"roxey/internal/localrelay"
+	"roxey/internal/manifest"
 )
 
 type Project struct {
@@ -160,6 +161,29 @@ func (rg *Registry) AllLocalHostFQDNs() []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// PrimaryLocalTLD returns the TLD the shared relay serves: the default when
+// any local project uses it, else the first registered local TLD. Empty when
+// no local project is registered.
+func (rg *Registry) PrimaryLocalTLD() string {
+	first := ""
+	for _, n := range rg.SortedNames() {
+		p := rg.Projects[n]
+		if !p.Local {
+			continue
+		}
+		if p.TLD == manifest.DefaultLocalTLD {
+			return p.TLD
+		}
+		if first == "" {
+			first = p.TLD
+		}
+	}
+	if first != "" {
+		return first
+	}
+	return manifest.DefaultLocalTLD
 }
 
 // FindHostCollisions reports hosts claimed by more than one live project.

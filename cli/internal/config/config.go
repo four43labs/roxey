@@ -72,6 +72,9 @@ func LogDir() string  { return filepath.Join(Dir(), "logs") }
 func BinDir() string  { return filepath.Join(Dir(), "bin") }
 func CertDir() string { return filepath.Join(Dir(), "certs") }
 
+// SocketPath is the privileged helper daemon's Unix socket.
+func SocketPath() string { return filepath.Join(Dir(), "helper.sock") }
+
 func configPath() string   { return filepath.Join(Dir(), "config.json") }
 func tunnelsPath() string  { return filepath.Join(Dir(), "tunnels.json") }
 func servicesPath() string { return filepath.Join(Dir(), "services.json") }
