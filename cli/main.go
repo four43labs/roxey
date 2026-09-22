@@ -9,12 +9,14 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -22,6 +24,7 @@ import (
 	"golang.org/x/term"
 
 	"roxey/internal/config"
+	"roxey/internal/controlplane"
 	"roxey/internal/doctor"
 	"roxey/internal/helper"
 	"roxey/internal/localca"
@@ -177,6 +180,26 @@ func processAlive(pid int) bool {
 		return false
 	}
 	return proc.Signal(syscall.Signal(0)) == nil
+}
+
+// targetPort extracts the port from a proxy target like "localhost:3001" or
+// "http://127.0.0.1:3001". ok is false when the target carries no explicit
+// port. Used to publish proxy routes to a control plane.
+func targetPort(target string) (int, bool) {
+	s := strings.TrimPrefix(strings.TrimPrefix(target, "http://"), "https://")
+	hostport := s
+	if i := strings.Index(s, "/"); i >= 0 {
+		hostport = s[:i]
+	}
+	_, rawPort, err := net.SplitHostPort(hostport)
+	if err != nil {
+		return 0, false
+	}
+	p, err := strconv.Atoi(rawPort)
+	if err != nil {
+		return 0, false
+	}
+	return p, true
 }
 
 // startOne spawns the detached tunnel worker for one route and records it.
@@ -452,6 +475,12 @@ func cmdUp(args []string) error {
 		return err
 	}
 
+	// Control-plane mode: publish the topology to an Xhetra control plane
+	// instead of tunnelling to a Roxey relay. The control plane assigns the
+	// public hosts and owns authentication.
+	cp := controlplane.FromEnv()
+	cpMode := cp != nil
+
 	// Preview identity: explicit flag wins; otherwise auto-detect worktrees.
 	projectName := filepath.Base(filepath.Dir(absFile))
 	branch := ""
@@ -473,21 +502,29 @@ func cmdUp(args []string) error {
 		branch = b
 		previewSlug = preview.Slugify(b)
 	}
-	if opts.online && !isPreview && hasDottedHosts(m) {
-		isPreview = true
-		previewSlug = preview.PathSlug(projectName, m.Dir)
-		branch = previewSlug
-	}
-	if isPreview {
-		projectName = preview.Apply(m, projectName, previewSlug)
-	}
-	if opts.online {
-		oldTLD, wasLocal := m.RelayServer.TLD, m.RelayServer.Local
-		m.RelayServer.Local = false
-		m.RelayServer.TLD = defaultTLD()
-		if wasLocal || oldTLD != m.RelayServer.TLD {
-			m.RelayServer.APIKey = ""
+	if !cpMode {
+		if opts.online && !isPreview && hasDottedHosts(m) {
+			isPreview = true
+			previewSlug = preview.PathSlug(projectName, m.Dir)
+			branch = previewSlug
 		}
+		if isPreview {
+			projectName = preview.Apply(m, projectName, previewSlug)
+		}
+		if opts.online {
+			oldTLD, wasLocal := m.RelayServer.TLD, m.RelayServer.Local
+			m.RelayServer.Local = false
+			m.RelayServer.TLD = defaultTLD()
+			if wasLocal || oldTLD != m.RelayServer.TLD {
+				m.RelayServer.APIKey = ""
+			}
+		}
+	} else {
+		// The control plane owns the public domain and authentication; ignore
+		// any relay/local settings in the manifest.
+		m.RelayServer.Local = false
+		m.RelayServer.APIKey = ""
+		m.RelayServer.TLD = cp.Domain
 	}
 	if opts.protect != "" {
 		for i := range m.Environments {
@@ -515,66 +552,102 @@ func cmdUp(args []string) error {
 		envHosts = append(envHosts, e.Host)
 	}
 
-	// Auto-register / update this project in the central registry.
-	reg, err := projects.Load()
-	if err != nil {
-		return err
-	}
-	registeredName, err := reg.Register(absDir, tld, m.RelayServer.Local, envHosts, branch, isPreview)
-	if err != nil {
-		return err
-	}
-	_ = registeredName
-
-	// Resolve the relay and API key.
-	apiKey := m.RelayServer.APIKey
-	if m.RelayServer.Local {
-		if err := ensureLocalRelay(m, reg); err != nil {
-			return err
-		}
-	} else if apiKey == "" {
-		sc, ok := config.ServerFor(tld)
-		if !ok || sc.APIKey == "" {
-			return fmt.Errorf("no API key for %s; set relay_server.api_key or run `roxey auth --tld %s <key>`", tld, tld)
-		}
-		apiKey = sc.APIKey
-	}
-	if apiKey != "" {
-		if err := config.SetServer(tld, config.ServerConfig{
-			APIKey: apiKey,
-			Local:  m.RelayServer.Local,
-		}); err != nil {
-			return err
-		}
-	}
-
-	if err := preview.AssignPorts(m, isPreview, runner.FreePort); err != nil {
-		return err
-	}
-
-	// Hosted labels include the account suffix. Resolve them before route
-	// environment templates so children receive authoritative public hosts.
+	apiKey := ""
 	displayHosts := map[string]string{}
-	if !m.RelayServer.Local && apiKey != "" {
-		requested := make([]string, 0, len(m.Environments))
-		for _, e := range m.Environments {
-			requested = append(requested, e.Host)
+	var runnerName string
+
+	if cpMode {
+		// Control-plane mode: the deployment assigns the public hosts and owns
+		// authentication. Keep the manifest's declared ports so the sandbox
+		// mirrors local development, and publish one topology per repo.
+		runnerName = preview.PathSlug(projectName, absDir)
+		if err := preview.AssignPorts(m, false, runner.FreePort); err != nil {
+			return err
 		}
-		displayHosts, err = relayapi.LookupHosts(tld, apiKey, requested)
+		origins := make([]string, 0, len(m.Environments))
+		for i := range m.Environments {
+			origins = append(origins, m.Environments[i].Host)
+		}
+		assigned, err := cp.LookupHosts(origins)
 		if err != nil {
-			return fmt.Errorf("lookup hosted relay names: %w", err)
+			return fmt.Errorf("control plane host lookup: %w", err)
 		}
 		m.AssignedHostMap = map[string]string{}
-		for declared, effective := range m.HostMap {
-			assigned, ok := displayHosts[effective]
-			if !ok || assigned == "" {
-				return fmt.Errorf("hosted relay did not assign a host for %q", effective)
+		for i := range m.Environments {
+			orig := m.Environments[i].Host
+			label, ok := assigned[orig]
+			if !ok || label == "" {
+				return fmt.Errorf("control plane did not assign a host for %q", orig)
 			}
-			m.AssignedHostMap[declared] = assigned
+			m.Environments[i].Host = label
+			m.HostMap[orig] = label
+			m.AssignedHostMap[orig] = label
 		}
-	}
-	if err := m.ResolveEnvTemplates(opts.online); err != nil {
-		return err
+		// Hosted mode: `{{online}}` renders as "1".
+		if err := m.ResolveEnvTemplates(true); err != nil {
+			return err
+		}
+	} else {
+		// Auto-register / update this project in the central registry.
+		reg, err := projects.Load()
+		if err != nil {
+			return err
+		}
+		registeredName, err := reg.Register(absDir, tld, m.RelayServer.Local, envHosts, branch, isPreview)
+		if err != nil {
+			return err
+		}
+		_ = registeredName
+
+		// Resolve the relay and API key.
+		apiKey = m.RelayServer.APIKey
+		if m.RelayServer.Local {
+			if err := ensureLocalRelay(m, reg); err != nil {
+				return err
+			}
+		} else if apiKey == "" {
+			sc, ok := config.ServerFor(tld)
+			if !ok || sc.APIKey == "" {
+				return fmt.Errorf("no API key for %s; set relay_server.api_key or run `roxey auth --tld %s <key>`", tld, tld)
+			}
+			apiKey = sc.APIKey
+		}
+		if apiKey != "" {
+			if err := config.SetServer(tld, config.ServerConfig{
+				APIKey: apiKey,
+				Local:  m.RelayServer.Local,
+			}); err != nil {
+				return err
+			}
+		}
+
+		if err := preview.AssignPorts(m, isPreview, runner.FreePort); err != nil {
+			return err
+		}
+
+		// Hosted labels include the account suffix. Resolve them before route
+		// environment templates so children receive authoritative public hosts.
+		if !m.RelayServer.Local && apiKey != "" {
+			requested := make([]string, 0, len(m.Environments))
+			for _, e := range m.Environments {
+				requested = append(requested, e.Host)
+			}
+			displayHosts, err = relayapi.LookupHosts(tld, apiKey, requested)
+			if err != nil {
+				return fmt.Errorf("lookup hosted relay names: %w", err)
+			}
+			m.AssignedHostMap = map[string]string{}
+			for declared, effective := range m.HostMap {
+				assigned, ok := displayHosts[effective]
+				if !ok || assigned == "" {
+					return fmt.Errorf("hosted relay did not assign a host for %q", effective)
+				}
+				m.AssignedHostMap[declared] = assigned
+			}
+		}
+		if err := m.ResolveEnvTemplates(opts.online); err != nil {
+			return err
+		}
 	}
 
 	// Collect run-routes and spawn services first.
@@ -687,16 +760,45 @@ func cmdUp(args []string) error {
 		}
 	}
 
-	// Open tunnels for every route.
-	for _, rr := range append(append([]runRoute{}, runs...), proxyRoutes...) {
-		r := rr.route
-		target := r.Target
-		if r.IsRun() {
-			target = fmt.Sprintf("localhost:%d", r.Port)
+	if cpMode {
+		// Publish the topology to the control plane instead of opening tunnels.
+		// The control plane resolves each port to the sandbox provider's URL and
+		// fronts every host behind its own authentication.
+		topology := make([]controlplane.Environment, 0, len(m.Environments))
+		for _, e := range m.Environments {
+			routes := make([]controlplane.Route, 0, len(e.Routes))
+			for _, r := range e.Routes {
+				port := r.Port
+				if !r.IsRun() {
+					if p, ok := targetPort(r.Target); ok {
+						port = p
+					}
+				}
+				if port <= 0 {
+					continue
+				}
+				routes = append(routes, controlplane.Route{Path: r.Path, Port: port})
+			}
+			if len(routes) == 0 {
+				continue
+			}
+			topology = append(topology, controlplane.Environment{Host: e.Host, Routes: routes})
 		}
-		pathPrefix := strings.TrimSuffix(r.Path, "/") // "/" (root) registers as ""
-		if err := startOne(tld, rr.env, pathPrefix, target, rr.protect, gateGroup, absFile); err != nil {
-			return err
+		if err := cp.Publish(runnerName, topology); err != nil {
+			return fmt.Errorf("publish to control plane: %w", err)
+		}
+	} else {
+		// Open tunnels for every route.
+		for _, rr := range append(append([]runRoute{}, runs...), proxyRoutes...) {
+			r := rr.route
+			target := r.Target
+			if r.IsRun() {
+				target = fmt.Sprintf("localhost:%d", r.Port)
+			}
+			pathPrefix := strings.TrimSuffix(r.Path, "/") // "/" (root) registers as ""
+			if err := startOne(tld, rr.env, pathPrefix, target, rr.protect, gateGroup, absFile); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -1014,6 +1116,16 @@ func cmdDown(args []string) error {
 		return err
 	}
 	tld := m.RelayServer.TLD
+
+	// Control-plane mode: remove the published topology so its hosts stop
+	// resolving at the deployment's edge.
+	if cp := controlplane.FromEnv(); cp != nil {
+		projectName := filepath.Base(filepath.Dir(absFile))
+		runnerName := preview.PathSlug(projectName, m.Dir)
+		if err := cp.Delete(runnerName); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: control plane delete failed: %v\n", err)
+		}
+	}
 
 	// Stop this manifest's tunnels.
 	tunnels, err := config.LoadTunnels()
