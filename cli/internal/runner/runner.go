@@ -20,6 +20,12 @@ import (
 	"roxey/internal/config"
 )
 
+// ReadyTimeout is how long a spawned service has to accept TCP connections.
+// The first start of a compiled or Next.js service can take well over a minute
+// on a cold machine, so this is generous; a genuinely failed start still
+// reports as soon as it exits (Spawn returns early when the child dies).
+var ReadyTimeout = 120 * time.Second
+
 // SpawnOptions describes one run-route service to start.
 type SpawnOptions struct {
 	Name        string
@@ -52,9 +58,10 @@ func Spawn(opts SpawnOptions) (int, error) {
 		return 0, fmt.Errorf("start %q: %w", opts.Command, err)
 	}
 	pid := cmd.Process.Pid
-	go func() { _ = cmd.Wait() }() // reap when it exits; we only track the PID
+	exited := make(chan struct{})
+	go func() { _ = cmd.Wait(); close(exited) }() // reap when it exits
 
-	if err := WaitPort(opts.Port, 30*time.Second); err != nil {
+	if err := waitPortOrExit(opts.Port, ReadyTimeout, exited); err != nil {
 		KillGroup(pid)
 		return pid, err
 	}
@@ -108,7 +115,7 @@ func SpawnForeground(opts SpawnOptions, writeFn func(line string)) (int, <-chan 
 	}
 	go func() { wg.Wait(); close(done) }()
 
-	if err := WaitPort(opts.Port, 30*time.Second); err != nil {
+	if err := waitPortOrExit(opts.Port, ReadyTimeout, done); err != nil {
 		KillGroup(pid)
 		<-done
 		return pid, done, err
@@ -197,6 +204,13 @@ func splitCommand(s string) ([]string, error) {
 
 // WaitPort polls until addr accepts TCP connections or timeout elapses.
 func WaitPort(port int, timeout time.Duration) error {
+	return waitPortOrExit(port, timeout, nil)
+}
+
+// waitPortOrExit is WaitPort that also gives up early when the child exits
+// (closed `exited`), so a crashed service reports promptly instead of waiting
+// out the whole readiness window.
+func waitPortOrExit(port int, timeout time.Duration, exited <-chan struct{}) error {
 	addr := net.JoinHostPort("127.0.0.1", fmt.Sprintf("%d", port))
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -205,7 +219,11 @@ func WaitPort(port int, timeout time.Duration) error {
 			conn.Close()
 			return nil
 		}
-		time.Sleep(250 * time.Millisecond)
+		select {
+		case <-exited:
+			return fmt.Errorf("service exited before port %d accepted connections", port)
+		case <-time.After(250 * time.Millisecond):
+		}
 	}
 	return fmt.Errorf("port %d did not accept connections within %s", port, timeout)
 }

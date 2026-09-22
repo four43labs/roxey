@@ -743,9 +743,15 @@ func cmdUp(args []string) error {
 		fmt.Printf("[service] %-24s pid %-7d port %d\n", rr.name, pid, r.Port)
 		return nil
 	}
+	// Start every run-route, tolerating individual failures: a preview of the
+	// services that did come up is far more useful than none, and the agent
+	// can fix the failing one and re-run. Failed services are reported below.
+	var failedServices []string
 	for _, rr := range runs {
 		if err := startService(rr); err != nil {
-			return err
+			fmt.Fprintf(os.Stderr, "[service] %s did not start: %v\n", rr.name, err)
+			failedServices = append(failedServices, rr.name)
+			continue
 		}
 	}
 	if err := config.SaveServices(services); err != nil {
@@ -823,6 +829,14 @@ func cmdUp(args []string) error {
 		fmt.Printf("  %s\n", strings.Join(parts, ", "))
 	}
 	fmt.Println()
+
+	if len(failedServices) > 0 {
+		fmt.Printf(
+			"warning: %d service(s) did not start: %s\n",
+			len(failedServices),
+			strings.Join(failedServices, ", "),
+		)
+	}
 
 	if detach {
 		return config.SaveServices(services)
