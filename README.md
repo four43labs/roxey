@@ -347,6 +347,24 @@ The repository is two independent Go modules plus an npm wrapper:
 - **`cli/`** — the `roxey` binary users install. Handles authentication, manifest loading/validation, spawning and supervising services, and running the background tunnel workers. This is what npm distributes as `@four43labs/roxey`.
 - **`npm/`** — a thin installer package; downloads the matching platform binary from GitHub Releases on first run.
 
+## Using Roxey as a library
+
+Roxey's building blocks are public Go packages, so another tool can run a `roxey.yaml` topology or
+host Roxey tunnels without shelling out to the `roxey` binary. [Teyliv](https://github.com/four43labs/teyliv)
+does both: `teyliv up` runs the same manifest through Teyliv's relay, and Teyliv's API hosts Roxey
+tunnels behind its own authentication.
+
+| Package | What it gives you |
+|---|---|
+| `github.com/four43labs/roxey/cli/manifest` | Load and validate `roxey.yaml`; resolve `{{host:…}}`, `{{port:…}}`, `{{online}}`. `LoadWith(path, LoadOptions{RelayOptional: true})` accepts a manifest without `relay_server` when you bring your own relay. |
+| `github.com/four43labs/roxey/cli/preview` | Worktree detection, DNS-safe slugs, and port assignment (`AssignPorts`) for run-routes and their proxy aliases. |
+| `github.com/four43labs/roxey/cli/runner` | Spawn run-route services (detached or foreground) with `PORT`/`HOST` and route environment, wait for readiness, tear down process groups. |
+| `github.com/four43labs/roxey/cli/tunnel` | The local side of a tunnel: `Dial` one route to a relay, or `Hold` it with automatic reconnects. Speaks the relay protocol (`/_ws`, `host:<label>` greeting, yamux over websocket frames). |
+| `github.com/four43labs/roxey/backend/relay` | The relay's routing table: register tunnels (as `Pending` until the local side has its host), resolve host/path to a tunnel, open raw streams. Bring your own HTTP server, authentication, and gating. |
+
+Tag convention for importers: the `cli` and `backend` modules are versioned as `cli/vX.Y.Z` and
+`backend/vX.Y.Z`; the `vX.Y.Z` tags publish the binaries.
+
 ## Choosing the Relay Backend
 
 By default the CLI talks to the relay operated by Four43 Labs at `roxey.f43.run` — no setup beyond `roxey auth`. You have three options, selected per project in the manifest's `relay_server` block:

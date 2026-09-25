@@ -12,7 +12,7 @@ import (
 	"runtime"
 	"strings"
 
-	"roxey/internal/localrelay"
+	"github.com/four43labs/roxey/cli/internal/localrelay"
 )
 
 const (

@@ -2,6 +2,11 @@
 // CLI). Each tunnel is a multiplexed session (yamux) over the CLI's
 // websocket; every public connection gets its own raw byte stream to the
 // local target.
+//
+// It is public so other servers can host Roxey tunnels with their own
+// authentication and gating (Teyliv's API does); roxey's relay binary is the
+// reference server. Entry.UserID is the owning account, or whatever tenant
+// the host server namespaces tunnels by.
 package relay
 
 import (
@@ -25,16 +30,39 @@ type Entry struct {
 	ConnectedAt time.Time
 	Remote      string
 
+	// Pending registers the route before the CLI has been told its host:
+	// OpenStream waits until Ready, so no stream frame can reach the CLI
+	// ahead of the "host:" greeting and no request can race ahead of the
+	// route. Set it on the template passed to Register.
+	Pending bool
+
 	session *yamux.Session
+	ready   chan struct{}
+	once    sync.Once
 }
 
-func newEntry(sess *yamux.Session, remote string) *Entry {
-	return &Entry{ConnectedAt: time.Now(), Remote: remote, session: sess}
+// ReadyTimeout bounds how long OpenStream waits for a pending entry.
+var ReadyTimeout = 10 * time.Second
+
+func newEntry(sess *yamux.Session, remote string, pending bool) *Entry {
+	e := &Entry{ConnectedAt: time.Now(), Remote: remote, session: sess, ready: make(chan struct{})}
+	if !pending {
+		close(e.ready)
+	}
+	return e
 }
+
+// Ready releases a pending entry once the CLI has its greeting.
+func (e *Entry) Ready() { e.once.Do(func() { close(e.ready) }) }
 
 // OpenStream dials a fresh raw TCP stream through the tunnel to the CLI's
 // local target. The caller speaks whatever protocol it wants on the bytes.
 func (e *Entry) OpenStream() (net.Conn, error) {
+	select {
+	case <-e.ready:
+	case <-time.After(ReadyTimeout):
+		return nil, errors.New("tunnel not ready")
+	}
 	if e.session.IsClosed() {
 		return nil, errors.New("tunnel closed")
 	}
@@ -104,7 +132,7 @@ func (r *Registry) Register(entry *Entry, pathPrefix string, sess *yamux.Session
 		r.table[entry.Host] = t
 	}
 
-	e := newEntry(sess, remote)
+	e := newEntry(sess, remote, entry.Pending)
 	e.Service = entry.Service
 	e.Host = entry.Host
 	e.UserID = entry.UserID

@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"roxey/internal/config"
+	"github.com/four43labs/roxey/cli/internal/config"
 )
 
 const (

@@ -16,9 +16,9 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/hashicorp/yamux"
 
-	"roxey-relay/internal/auth"
-	"roxey-relay/internal/relay"
-	"roxey-relay/internal/store"
+	"github.com/four43labs/roxey/backend/internal/auth"
+	"github.com/four43labs/roxey/backend/internal/store"
+	"github.com/four43labs/roxey/backend/relay"
 )
 
 const testDomain = "example.test"
@@ -731,4 +731,32 @@ func TestUngroupedAndSingleUserGatesRemainHostScoped(t *testing.T) {
 func sha256Hex(s string) string {
 	sum := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(sum[:])
+}
+
+// TestTunnelRoutableOnGreeting guards the connect race: the relay must
+// register a tunnel before it sends the "host:" greeting, so a CLI that
+// reports "connected" never has its first public request answered "no
+// active tunnel".
+func TestTunnelRoutableOnGreeting(t *testing.T) {
+	st := testStore(t)
+	reg := relay.NewRegistry()
+	sessions := auth.NewSessions("test-secret")
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	relaySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handleWSUpgrade(upgrader, reg, st, sessions, testDomain, false, w, r)
+	}))
+	defer relaySrv.Close()
+	_, key := makeUserWithKey(t, st, "race@x.test")
+
+	for i := 0; i < 50; i++ {
+		conn, host := dialTunnel(t, relaySrv, key, "race")
+		if reg.Resolve(host, "/") == nil {
+			t.Fatalf("attempt %d: %s was not routable when its greeting arrived", i, host)
+		}
+		conn.Close()
+		deadline := time.Now().Add(2 * time.Second)
+		for reg.Resolve(host, "/") != nil && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+	}
 }

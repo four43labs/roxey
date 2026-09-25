@@ -6,7 +6,7 @@ import (
 	"os"
 	"time"
 
-	"roxey/internal/config"
+	"github.com/four43labs/roxey/cli/internal/config"
 )
 
 // Available reports whether a helper daemon is listening and authorized.

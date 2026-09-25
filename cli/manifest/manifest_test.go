@@ -275,3 +275,29 @@ func indexOf(s, sub string) int {
 	}
 	return -1
 }
+
+func TestLoadWithRelayOptional(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "roxey.yaml")
+	body := "environments:\n  - host: app\n    routes:\n      \"/\": localhost:3000\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("roxey itself still requires relay_server")
+	}
+	m, err := LoadWith(path, LoadOptions{RelayOptional: true})
+	if err != nil {
+		t.Fatalf("an embedder brings its own relay: %v", err)
+	}
+	if m.Environments[0].Routes[0].Target != "localhost:3000" || m.HostMap["app"] != "app" {
+		t.Fatalf("manifest = %+v", m)
+	}
+	bad := "relay_server:\n  tld: \"Bad TLD\"\n" + body
+	if err := os.WriteFile(path, []byte(bad), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadWith(path, LoadOptions{RelayOptional: true}); err == nil {
+		t.Fatal("a relay_server block that is present is still validated")
+	}
+}

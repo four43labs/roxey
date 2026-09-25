@@ -1,4 +1,4 @@
-module roxey-relay
+module github.com/four43labs/roxey/backend
 
 go 1.26.1
 

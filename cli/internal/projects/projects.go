@@ -12,9 +12,9 @@ import (
 	"sort"
 	"time"
 
-	"roxey/internal/config"
-	"roxey/internal/localrelay"
-	"roxey/internal/manifest"
+	"github.com/four43labs/roxey/cli/internal/config"
+	"github.com/four43labs/roxey/cli/internal/localrelay"
+	"github.com/four43labs/roxey/cli/manifest"
 )
 
 type Project struct {

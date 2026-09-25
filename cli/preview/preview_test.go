@@ -4,7 +4,7 @@ import (
 	"os"
 	"testing"
 
-	"roxey/internal/manifest"
+	"github.com/four43labs/roxey/cli/manifest"
 )
 
 const yamlBase = `

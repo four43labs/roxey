@@ -19,7 +19,7 @@ import (
 	"strconv"
 	"strings"
 
-	"roxey/internal/manifest"
+	"github.com/four43labs/roxey/cli/manifest"
 )
 
 // Identity describes one preview instance.

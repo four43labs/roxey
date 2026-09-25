@@ -1,7 +1,8 @@
 // Package runner spawns and manages the app processes behind `roxey up`
 // run-routes: detached (or piped for foreground mode), with PORT/HOST plus
 // manifest environment injected, a TCP readiness poll, and process-group
-// teardown on `down`/Ctrl-C.
+// teardown on `down`/Ctrl-C. It is public so other tools can run a roxey.yaml
+// topology the way roxey does (for example Teyliv's `teyliv up`).
 package runner
 
 import (
@@ -16,8 +17,6 @@ import (
 	"sync"
 	"syscall"
 	"time"
-
-	"roxey/internal/config"
 )
 
 // ReadyTimeout is how long a spawned service has to accept TCP connections.
@@ -298,15 +297,5 @@ func alive(pid int) bool {
 	return syscall.Kill(pid, 0) == nil
 }
 
-// PruneDead removes services.json entries whose processes have exited.
-func PruneDead(services map[string]config.ServiceInfo) map[string]config.ServiceInfo {
-	out := make(map[string]config.ServiceInfo, len(services))
-	for k, info := range services {
-		if alive(info.PID) {
-			out[k] = info
-		} else if info.LogFile != "" {
-			_ = os.Truncate(info.LogFile, 0)
-		}
-	}
-	return out
-}
+// Alive reports whether pid is a live process.
+func Alive(pid int) bool { return alive(pid) }

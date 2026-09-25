@@ -1,4 +1,4 @@
-module roxey
+module github.com/four43labs/roxey/cli
 
 go 1.26.1
 

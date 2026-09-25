@@ -10,9 +10,9 @@ import (
 	"syscall"
 	"time"
 
-	"roxey/internal/config"
-	"roxey/internal/localrelay"
-	"roxey/internal/runner"
+	"github.com/four43labs/roxey/cli/internal/config"
+	"github.com/four43labs/roxey/cli/internal/localrelay"
+	"github.com/four43labs/roxey/cli/runner"
 )
 
 // RelaySupervisor owns the root relay child process: it starts the relay for

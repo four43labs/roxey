@@ -23,19 +23,19 @@ import (
 
 	"golang.org/x/term"
 
-	"roxey/internal/config"
-	"roxey/internal/controlplane"
-	"roxey/internal/doctor"
-	"roxey/internal/helper"
-	"roxey/internal/localca"
-	"roxey/internal/localrelay"
-	"roxey/internal/manifest"
-	"roxey/internal/preview"
-	"roxey/internal/projects"
-	"roxey/internal/relayapi"
-	"roxey/internal/runner"
-	"roxey/internal/service"
-	"roxey/internal/tunnel"
+	"github.com/four43labs/roxey/cli/internal/config"
+	"github.com/four43labs/roxey/cli/internal/controlplane"
+	"github.com/four43labs/roxey/cli/internal/doctor"
+	"github.com/four43labs/roxey/cli/internal/helper"
+	"github.com/four43labs/roxey/cli/internal/localca"
+	"github.com/four43labs/roxey/cli/internal/localrelay"
+	"github.com/four43labs/roxey/cli/internal/projects"
+	"github.com/four43labs/roxey/cli/internal/relayapi"
+	"github.com/four43labs/roxey/cli/internal/service"
+	"github.com/four43labs/roxey/cli/internal/worker"
+	"github.com/four43labs/roxey/cli/manifest"
+	"github.com/four43labs/roxey/cli/preview"
+	"github.com/four43labs/roxey/cli/runner"
 )
 
 func env(key, def string) string {
@@ -371,7 +371,7 @@ func cmdRun(args []string) error {
 	if len(args) > 5 {
 		gateGroup = args[5]
 	}
-	return tunnel.Run(args[0], args[1], args[2], args[3], protect, gateGroup)
+	return worker.Run(args[0], args[1], args[2], args[3], protect, gateGroup)
 }
 
 // ── up / down ────────────────────────────────────────────────────────────
@@ -674,7 +674,7 @@ func cmdUp(args []string) error {
 	// Restart semantics: anything this manifest left running from a
 	// previous (possibly crashed) run is stopped first, then brought up
 	// fresh. This keeps `roxey up` deterministic and orphans impossible.
-	services = runner.PruneDead(services)
+	services = pruneDeadServices(services)
 	for k, svc := range services {
 		if svc.ManifestPath != absFile {
 			continue
@@ -1838,3 +1838,16 @@ func newGateGroup() (string, error) {
 }
 
 func now() string { return time.Now().UTC().Format(time.RFC3339) }
+
+// pruneDeadServices removes services.json entries whose processes have exited.
+func pruneDeadServices(services map[string]config.ServiceInfo) map[string]config.ServiceInfo {
+	out := make(map[string]config.ServiceInfo, len(services))
+	for k, info := range services {
+		if runner.Alive(info.PID) {
+			out[k] = info
+		} else if info.LogFile != "" {
+			_ = os.Truncate(info.LogFile, 0)
+		}
+	}
+	return out
+}

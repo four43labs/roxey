@@ -83,7 +83,18 @@ var hostRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
 const DefaultLocalTLD = "dev"
 
 // Load reads and validates the manifest at path.
-func Load(path string) (*Manifest, error) {
+func Load(path string) (*Manifest, error) { return LoadWith(path, LoadOptions{}) }
+
+// LoadOptions tunes Load for tools that run roxey.yaml topologies themselves.
+type LoadOptions struct {
+	// RelayOptional accepts a manifest without a relay_server block: the
+	// caller brings its own relay and sets RelayServer.TLD before resolving
+	// templates. A relay_server block that is present is still validated.
+	RelayOptional bool
+}
+
+// LoadWith reads and validates the manifest at path with opts.
+func LoadWith(path string, opts LoadOptions) (*Manifest, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -93,7 +104,13 @@ func Load(path string) (*Manifest, error) {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
 	m.Dir = filepath.Dir(abs(path))
-	if err := m.Validate(); err != nil {
+	rs := m.RelayServer
+	if opts.RelayOptional && rs.TLD == "" && !rs.Local && rs.APIKey == "" {
+		err = m.validateEnvironments()
+	} else {
+		err = m.Validate()
+	}
+	if err != nil {
 		return nil, err
 	}
 	m.initHostMap()
@@ -200,7 +217,11 @@ func (m *Manifest) Validate() error {
 	if rs.Local && rs.APIKey != "" {
 		return fmt.Errorf("relay_server.api_key cannot be combined with local: true")
 	}
+	return m.validateEnvironments()
+}
 
+// validateEnvironments checks the hosts and routes (everything but the relay).
+func (m *Manifest) validateEnvironments() error {
 	if len(m.Environments) == 0 {
 		return fmt.Errorf("at least one environment is required")
 	}

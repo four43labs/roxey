@@ -16,11 +16,11 @@ import (
 	"syscall"
 	"time"
 
-	"roxey/internal/config"
-	"roxey/internal/helper"
-	"roxey/internal/localca"
-	"roxey/internal/localrelay"
-	"roxey/internal/service"
+	"github.com/four43labs/roxey/cli/internal/config"
+	"github.com/four43labs/roxey/cli/internal/helper"
+	"github.com/four43labs/roxey/cli/internal/localca"
+	"github.com/four43labs/roxey/cli/internal/localrelay"
+	"github.com/four43labs/roxey/cli/internal/service"
 )
 
 type Status int

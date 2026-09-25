@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"roxey/internal/config"
+	"github.com/four43labs/roxey/cli/internal/config"
 )
 
 // testStateDir returns a short-lived state dir under /tmp: the Unix socket

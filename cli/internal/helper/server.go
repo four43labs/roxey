@@ -7,10 +7,10 @@ import (
 	"path/filepath"
 	"sync"
 
-	"roxey/internal/config"
-	"roxey/internal/localca"
-	"roxey/internal/localrelay"
-	"roxey/internal/projects"
+	"github.com/four43labs/roxey/cli/internal/config"
+	"github.com/four43labs/roxey/cli/internal/localca"
+	"github.com/four43labs/roxey/cli/internal/localrelay"
+	"github.com/four43labs/roxey/cli/internal/projects"
 )
 
 // Server answers helper RPCs on the daemon side. It is deliberately small:

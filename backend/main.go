@@ -30,9 +30,9 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/hashicorp/yamux"
 
-	"roxey-relay/internal/auth"
-	"roxey-relay/internal/relay"
-	"roxey-relay/internal/store"
+	"github.com/four43labs/roxey/backend/internal/auth"
+	"github.com/four43labs/roxey/backend/internal/store"
+	"github.com/four43labs/roxey/backend/relay"
 )
 
 //go:embed web
@@ -436,7 +436,13 @@ func buildMux(o buildMuxOpts) http.Handler {
 		out := map[string]string{}
 		for _, s := range strings.Split(r.URL.Query().Get("services"), ",") {
 			s = strings.TrimSpace(s)
-			if err := relay.ValidateService(s); err != nil {
+			// Mirror handleWSUpgrade: single-user relays serve bare
+			// multi-label names (app.proja), so they must resolve too.
+			if o.singleUser {
+				if !looseServiceRe.MatchString(s) {
+					continue
+				}
+			} else if err := relay.ValidateService(s); err != nil {
 				continue
 			}
 			out[s] = tunnelHost(o.singleUser, userID, s, o.domain)
@@ -542,21 +548,8 @@ func handleWSUpgrade(upgrader websocket.Upgrader, reg *relay.Registry, st *store
 		return
 	}
 
-	if err := reg.Check(host, pathPrefix); err != nil {
-		http.Error(w, err.Error(), http.StatusConflict)
-		return
-	}
-
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		return
-	}
-
-	// Gorilla strips custom headers from 101 responses, so the assigned
-	// public host travels as the first websocket message instead. The CLI
-	// must consume it before starting its yamux client.
-	if err := conn.WriteMessage(websocket.TextMessage, []byte("host:"+host)); err != nil {
-		conn.Close()
 		return
 	}
 
@@ -568,12 +561,18 @@ func handleWSUpgrade(upgrader websocket.Upgrader, reg *relay.Registry, st *store
 		return
 	}
 
+	// Register before the greeting, as pending: once the CLI reads its host
+	// it reports the tunnel as connected, so the route must already exist
+	// (a request would otherwise get "no active tunnel"). Pending holds any
+	// early request until the greeting is out, so no stream frame reaches
+	// the CLI before it.
 	entry, err := reg.Register(&relay.Entry{
 		Service:     service,
 		Host:        host,
 		UserID:      userID,
 		GateGroup:   r.URL.Query().Get("gate_group"),
 		ProtectHash: protectHash,
+		Pending:     true,
 	}, pathPrefix, sess, r.RemoteAddr)
 	if err != nil {
 		_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(4000, err.Error()), time.Now().Add(time.Second))
@@ -581,6 +580,19 @@ func handleWSUpgrade(upgrader websocket.Upgrader, reg *relay.Registry, st *store
 		conn.Close()
 		return
 	}
+
+	// Gorilla strips custom headers from 101 responses, so the assigned
+	// public host travels as the first websocket message instead. The CLI
+	// must consume it before starting its yamux client. While the entry is
+	// pending yamux has nothing to send (its first keepalive is 30s out), so
+	// this is the only writer.
+	if err := conn.WriteMessage(websocket.TextMessage, []byte("host:"+host)); err != nil {
+		reg.Unregister(host, pathPrefix, entry)
+		sess.Close()
+		conn.Close()
+		return
+	}
+	entry.Ready()
 
 	eventID, err := st.RecordConnect(userID, service, host, pathPrefix, r.RemoteAddr)
 	if err != nil {
