@@ -15,7 +15,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -52,7 +51,7 @@ func Spawn(opts SpawnOptions) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	newSession(cmd)
 	if err := cmd.Start(); err != nil {
 		return 0, fmt.Errorf("start %q: %w", opts.Command, err)
 	}
@@ -90,7 +89,7 @@ func SpawnForeground(opts SpawnOptions, writeFn func(line string)) (int, <-chan 
 		stderrW.Close()
 		return 0, nil, err
 	}
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	newSession(cmd)
 	if err := cmd.Start(); err != nil {
 		return 0, nil, fmt.Errorf("start %q: %w", opts.Command, err)
 	}
@@ -234,7 +233,7 @@ func KillGroup(pid int) {
 		return
 	}
 	neg := -pid
-	_ = syscall.Kill(neg, syscall.SIGTERM)
+	signalGroup(neg, false)
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if !alive(pid) {
@@ -242,7 +241,7 @@ func KillGroup(pid int) {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	_ = syscall.Kill(neg, syscall.SIGKILL)
+	signalGroup(neg, true)
 }
 
 // PortListeners returns the PIDs of processes listening on the given TCP
@@ -278,7 +277,7 @@ func ReclaimPort(port int) []int {
 		return nil
 	}
 	for _, pid := range pids {
-		_ = syscall.Kill(pid, syscall.SIGTERM)
+		signalProcess(pid, false)
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
@@ -288,13 +287,9 @@ func ReclaimPort(port int) []int {
 		time.Sleep(100 * time.Millisecond)
 	}
 	for _, pid := range PortListeners(port) {
-		_ = syscall.Kill(pid, syscall.SIGKILL)
+		signalProcess(pid, true)
 	}
 	return pids
-}
-
-func alive(pid int) bool {
-	return syscall.Kill(pid, 0) == nil
 }
 
 // Alive reports whether pid is a live process.
