@@ -110,13 +110,21 @@ environments:
   - host: shop              # -> https://shop.f43.run
     routes:
       "/": website:3001     # proxy to a running address...
-      "/api": localhost:8000
+      "/api": "localhost:{{port:api}}"   # ...or to a spawned one (see below)
       "/storefront":        # ...or have roxey spawn the command itself
+        name: storefront    # optional handle, referenced as {{port:storefront}}
         command: npm run dev
         cwd: apps/web       # optional; default is the manifest's directory
-        port: 3000          # required for spawned services (exported as PORT)
+        port: 0             # optional; omit or 0 to let roxey assign a free port
         environment:        # extra env vars for the child process
           NODE_ENV: development
+          API_URL: "http://127.0.0.1:{{port:api}}/api"
+  - host: internal
+    routes:
+      "/api":
+        name: api
+        command: npm run api
+        # no port -> roxey assigns one and exports it as PORT
 ```
 
 ```bash
@@ -128,7 +136,13 @@ roxey down    # stop this manifest's tunnels and spawned services
 ```
 
 Spawned services receive `PORT`, `HOST=127.0.0.1`, and their `environment`
-map. `up` waits until each port accepts connections before opening its
+map. A spawned route's `port` is optional: leave it out (or set `0`) and roxey
+assigns a free port at `up`, so several projects can run at once without
+colliding. Give the route a `name` and any route — in any environment — can
+reference it as `{{port:<name>}}` in its `environment` values or its `target`
+address; the reference follows whatever port the service ends up on (assigned
+or pinned). Set `port:` to a number to pin one when you need a stable value.
+`up` waits until each port accepts connections before opening its
 tunnel, and re-running it restarts the manifest's services and tunnels from
 a clean slate — a crashed run can never leave orphans behind.
 
@@ -253,10 +267,12 @@ environment:
   #   https://api.netflix.dev on the main checkout — same yaml file everywhere
 ```
 
-`{{port:host}}` resolves to that declared host's spawned `/` route after
-preview port allocation. `{{online}}` is `1` under `--online` and empty
-otherwise. On hosted relays, `{{host:host}}` uses the relay's actual assigned
-hostname, including its account suffix.
+`{{port:<name>}}` resolves to the spawned route with that `name`; `{{port:<host>}}`
+resolves to the named host's spawned `/` route. Both work in a route's
+`environment` values and in a proxy route's `target`, after port allocation —
+so a service with no fixed port is still addressable. `{{online}}` is `1` under
+`--online` and empty otherwise. On hosted relays, `{{host:<host>}}` uses the
+relay's actual assigned hostname, including its account suffix.
 
 Note: stateful dependencies stay shared — a preview talks to the same Postgres unless you give it its own.
 Everything binds to loopback only — nothing is reachable from other machines unless you also point a remote relay at them.

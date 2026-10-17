@@ -182,6 +182,43 @@ environments:
 	}
 }
 
+func TestAssignPortsResolvesNamedTargets(t *testing.T) {
+	m, _ := loadManifest(t, `
+relay_server: {tld: dev}
+environments:
+  - host: shop
+    routes:
+      "/": localhost:{{port:web}}
+      "/api": localhost:{{port:api}}
+  - host: internal
+    routes:
+      "/web":
+        name: web
+        command: web
+      "/api":
+        name: api
+        command: api
+`)
+	ports := []int{5100, 5101}
+	next := 0
+	if err := AssignPorts(m, false, func() (int, error) {
+		port := ports[next]
+		next++
+		return port, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ResolveTemplates(false); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.Environments[0].Routes[0].Target; got != "localhost:5100" {
+		t.Fatalf("named target = %q", got)
+	}
+	if got := m.Environments[0].Routes[1].Target; got != "localhost:5101" {
+		t.Fatalf("named target = %q", got)
+	}
+}
+
 func stringsRepeat(s string, n int) string {
 	out := make([]byte, 0, n)
 	for i := 0; i < n; i++ {

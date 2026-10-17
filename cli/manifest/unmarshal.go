@@ -24,6 +24,7 @@ func (r *Route) UnmarshalYAML(value *yaml.Node) error {
 
 	var raw struct {
 		Command     string            `yaml:"command"`
+		Name        string            `yaml:"name"`
 		Cwd         string            `yaml:"cwd"`
 		Port        int               `yaml:"port"`
 		Environment map[string]string `yaml:"environment"`
@@ -32,6 +33,7 @@ func (r *Route) UnmarshalYAML(value *yaml.Node) error {
 		return fmt.Errorf("invalid route mapping: %w", err)
 	}
 	r.Command = raw.Command
+	r.Name = raw.Name
 	r.Cwd = raw.Cwd
 	r.Port = raw.Port
 	r.Environment = raw.Environment

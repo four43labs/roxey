@@ -584,7 +584,7 @@ func cmdUp(args []string) error {
 			m.AssignedHostMap[orig] = label
 		}
 		// Hosted mode: `{{online}}` renders as "1".
-		if err := m.ResolveEnvTemplates(true); err != nil {
+		if err := m.ResolveTemplates(true); err != nil {
 			return err
 		}
 	} else {
@@ -645,7 +645,7 @@ func cmdUp(args []string) error {
 				m.AssignedHostMap[declared] = assigned
 			}
 		}
-		if err := m.ResolveEnvTemplates(opts.online); err != nil {
+		if err := m.ResolveTemplates(opts.online); err != nil {
 			return err
 		}
 	}

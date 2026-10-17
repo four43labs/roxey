@@ -258,8 +258,105 @@ environments:
 		t.Fatal(err)
 	}
 	err = m.ResolveEnvTemplates(false)
-	if err == nil || !contains(err.Error(), `unknown host "missing"`) {
-		t.Fatalf("expected unknown port host error, got %v", err)
+	if err == nil || !contains(err.Error(), `unknown host or service "missing"`) {
+		t.Fatalf("expected unknown port name error, got %v", err)
+	}
+}
+
+func TestNamedPortResolvesInEnvAndTarget(t *testing.T) {
+	m, err := Load(write(t, `
+relay_server: {tld: dev}
+environments:
+  - host: shop
+    routes:
+      "/": localhost:{{port:web}}
+      "/cart": localhost:{{port:web}}
+      "/api": 127.0.0.1:{{port:api}}
+  - host: app
+    routes:
+      "/":
+        command: app
+        environment:
+          API_URL: http://127.0.0.1:{{port:api}}/api
+  - host: internal
+    routes:
+      "/web":
+        name: web
+        command: web
+        port: 4100
+      "/api":
+        name: api
+        command: api
+        port: 4200
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ResolveTemplates(false); err != nil {
+		t.Fatal(err)
+	}
+	targets := map[string]string{"/": "localhost:4100", "/cart": "localhost:4100", "/api": "127.0.0.1:4200"}
+	for _, r := range m.Environments[0].Routes {
+		if want := targets[r.Path]; want != r.Target {
+			t.Fatalf("target %s = %q, want %q", r.Path, r.Target, want)
+		}
+	}
+	if got := m.Environments[1].Routes[0].Environment["API_URL"]; got != "http://127.0.0.1:4200/api" {
+		t.Fatalf("env template = %q", got)
+	}
+}
+
+func TestRouteNameValidation(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "duplicate",
+			body: `
+      "/one": {name: web, command: a}
+      "/two": {name: web, command: b}`,
+			want: "already used",
+		},
+		{
+			name: "collides with host",
+			body: `
+      "/one": {name: api, command: a}`,
+			want: "collides with an environment host",
+		},
+		{
+			name: "not a label",
+			body: `
+      "/one": {name: "Bad Name", command: a}`,
+			want: "must be a DNS label",
+		},
+		{
+			name: "requires a command",
+			body: `
+      "/one": {name: web}`,
+			want: "requires a command",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			extraHost := ""
+			if tc.name == "collides with host" {
+				extraHost = `
+  - host: api
+    routes:
+      "/": localhost:1`
+			}
+			_, err := Load(write(t, `
+relay_server: {tld: dev}
+environments:
+  - host: app
+    routes:`+tc.body+extraHost+`
+`))
+			if err == nil || !contains(err.Error(), tc.want) {
+				t.Fatalf("want error containing %q, got %v", tc.want, err)
+			}
+		})
 	}
 }
 

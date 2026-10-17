@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -35,7 +36,12 @@ type RunService struct {
 // Route is one path within an environment. Either Target (proxy to an
 // already-running address) or Command (roxey spawns it) is set, never both.
 type Route struct {
-	Path        string
+	Path string
+	// Name is an optional handle for a spawned route. Any route can address
+	// it as {{port:<name>}} in its environment values or target address, so a
+	// service whose port roxey assigns can be referenced without hardcoding a
+	// number. It must be a unique DNS label and must not shadow a host name.
+	Name        string
 	Target      string
 	Command     string
 	Cwd         string
@@ -128,48 +134,43 @@ func (m *Manifest) initHostMap() {
 	}
 }
 
+// ResolveTemplates replaces {{host:…}}, {{port:…}} and {{online}} placeholders
+// across the manifest: every route's environment values and, for proxy routes,
+// the target address. Call it after ports are assigned (preview.AssignPorts),
+// so {{port:…}} can resolve to a spawned service's assigned port.
+func (m *Manifest) ResolveTemplates(online bool) error {
+	if err := m.ResolveEnvTemplates(online); err != nil {
+		return err
+	}
+	return m.ResolveRouteTargets()
+}
+
+// ResolveRouteTargets replaces {{port:…}} placeholders in proxy-route targets,
+// letting a route point at a spawned service whose port roxey assigned. Run
+// routes are skipped: their target is the localhost:<port> roxey dials.
+func (m *Manifest) ResolveRouteTargets() error {
+	ix := m.portIndex()
+	for i := range m.Environments {
+		env := &m.Environments[i]
+		for j := range env.Routes {
+			r := &env.Routes[j]
+			if r.IsRun() {
+				continue
+			}
+			resolved, err := resolvePortTemplates(r.Target, ix)
+			if err != nil {
+				return fmt.Errorf("resolve target for %s%s: %w", env.Host, r.Path, err)
+			}
+			r.Target = resolved
+		}
+	}
+	return nil
+}
+
 // ResolveEnvTemplates replaces public host, spawned root-route port, and
 // online-mode placeholders in route environment values.
 func (m *Manifest) ResolveEnvTemplates(online bool) error {
-	hostSub := func(match []byte) []byte {
-		name := string(hostTemplateRe.FindSubmatch(match)[1])
-		host := name
-		if assigned, ok := m.AssignedHostMap[name]; ok {
-			host = assigned
-		} else if final, ok := m.HostMap[name]; ok {
-			host = final
-		}
-		return []byte(host + "." + m.RelayServer.TLD)
-	}
-	portFor := func(name string) (int, error) {
-		effective, ok := m.HostMap[name]
-		if !ok {
-			return 0, fmt.Errorf("unknown host %q in port template", name)
-		}
-		count, port := 0, 0
-		for i := range m.Environments {
-			if m.Environments[i].Host != effective {
-				continue
-			}
-			for j := range m.Environments[i].Routes {
-				r := &m.Environments[i].Routes[j]
-				if r.Path == "/" && r.IsRun() {
-					count++
-					port = r.Port
-				}
-			}
-		}
-		if count == 0 {
-			return 0, fmt.Errorf("host %q has no spawned root route for port template", name)
-		}
-		if count > 1 {
-			return 0, fmt.Errorf("host %q has multiple spawned root routes for port template", name)
-		}
-		if port <= 0 {
-			return 0, fmt.Errorf("host %q spawned root route has no assigned port", name)
-		}
-		return port, nil
-	}
+	ix := m.portIndex()
 	onlineValue := ""
 	if online {
 		onlineValue = "1"
@@ -178,26 +179,114 @@ func (m *Manifest) ResolveEnvTemplates(online bool) error {
 		env := &m.Environments[i]
 		for j := range env.Routes {
 			for k, v := range env.Routes[j].Environment {
-				resolved := hostTemplateRe.ReplaceAllFunc([]byte(v), hostSub)
-				var resolveErr error
-				resolved = portTemplateRe.ReplaceAllFunc(resolved, func(match []byte) []byte {
-					name := string(portTemplateRe.FindSubmatch(match)[1])
-					port, err := portFor(name)
-					if err != nil {
-						resolveErr = err
-						return match
-					}
-					return []byte(fmt.Sprintf("%d", port))
+				resolved := hostTemplateRe.ReplaceAllStringFunc(v, func(match string) string {
+					name := string(hostTemplateRe.FindStringSubmatch(match)[1])
+					return ix.host(name) + "." + m.RelayServer.TLD
 				})
-				if resolveErr != nil {
-					return fmt.Errorf("resolve environment %s for %s%s: %w", k, env.Host, env.Routes[j].Path, resolveErr)
+				resolved, err := resolvePortTemplates(resolved, ix)
+				if err != nil {
+					return fmt.Errorf("resolve environment %s for %s%s: %w", k, env.Host, env.Routes[j].Path, err)
 				}
-				resolved = []byte(strings.ReplaceAll(string(resolved), "{{online}}", onlineValue))
-				env.Routes[j].Environment[k] = string(resolved)
+				resolved = strings.ReplaceAll(resolved, "{{online}}", onlineValue)
+				env.Routes[j].Environment[k] = resolved
 			}
 		}
 	}
 	return nil
+}
+
+// portIndex resolves {{port:…}} names: a spawned route's Name first, then the
+// historical host form (a host's "/" run route).
+type portIndex struct {
+	named    map[string]int
+	manifest *Manifest
+}
+
+func (m *Manifest) portIndex() *portIndex {
+	named := map[string]int{}
+	for i := range m.Environments {
+		for j := range m.Environments[i].Routes {
+			r := &m.Environments[i].Routes[j]
+			if r.IsRun() && r.Name != "" {
+				named[r.Name] = r.Port
+			}
+		}
+	}
+	return &portIndex{named: named, manifest: m}
+}
+
+// host returns a placeholder host's effective name (a preview slug or hosted
+// label may have rewritten it), defaulting to the declared name.
+func (ix *portIndex) host(name string) string {
+	if assigned, ok := ix.manifest.AssignedHostMap[name]; ok {
+		return assigned
+	}
+	if final, ok := ix.manifest.HostMap[name]; ok {
+		return final
+	}
+	return name
+}
+
+func (ix *portIndex) port(name string) (int, error) {
+	if port, ok := ix.named[name]; ok {
+		return assignedPort("service", name, port)
+	}
+	effective, ok := ix.manifest.HostMap[name]
+	if !ok {
+		return 0, fmt.Errorf("unknown host or service %q in port template", name)
+	}
+	count, port := 0, 0
+	for i := range ix.manifest.Environments {
+		if ix.manifest.Environments[i].Host != effective {
+			continue
+		}
+		for j := range ix.manifest.Environments[i].Routes {
+			r := &ix.manifest.Environments[i].Routes[j]
+			if r.Path == "/" && r.IsRun() {
+				count++
+				port = r.Port
+			}
+		}
+	}
+	if count == 0 {
+		return 0, fmt.Errorf("host %q has no spawned root route for port template", name)
+	}
+	if count > 1 {
+		return 0, fmt.Errorf("host %q has multiple spawned root routes for port template", name)
+	}
+	return assignedPort("host", name, port)
+}
+
+func assignedPort(kind, name string, port int) (int, error) {
+	if port <= 0 {
+		return 0, fmt.Errorf("%s %q has no assigned port for port template", kind, name)
+	}
+	return port, nil
+}
+
+// resolvePortTemplates substitutes every {{port:…}} in s, returning the first
+// resolution error.
+func resolvePortTemplates(s string, ix *portIndex) (string, error) {
+	if !strings.Contains(s, "{{") {
+		return s, nil
+	}
+	var resolveErr error
+	out := portTemplateRe.ReplaceAllStringFunc(s, func(match string) string {
+		if resolveErr != nil {
+			return match
+		}
+		name := string(portTemplateRe.FindStringSubmatch(match)[1])
+		port, err := ix.port(name)
+		if err != nil {
+			resolveErr = err
+			return match
+		}
+		return strconv.Itoa(port)
+	})
+	if resolveErr != nil {
+		return "", resolveErr
+	}
+	return out, nil
 }
 
 func (m *Manifest) Validate() error {
@@ -225,7 +314,7 @@ func (m *Manifest) validateEnvironments() error {
 	if len(m.Environments) == 0 {
 		return fmt.Errorf("at least one environment is required")
 	}
-	seenHosts := map[string]bool{}
+	hosts := make(map[string]bool, len(m.Environments))
 	for i := range m.Environments {
 		env := &m.Environments[i]
 		label := "environments[" + itoa(i) + "]"
@@ -233,11 +322,16 @@ func (m *Manifest) validateEnvironments() error {
 			return fmt.Errorf("%s.host %q must be a DNS name (labels like %q or dotted like %q)",
 				label, env.Host, "app", "app.verifycate")
 		}
-		if seenHosts[env.Host] {
+		if hosts[env.Host] {
 			return fmt.Errorf("%s.host %q is duplicated", label, env.Host)
 		}
-		seenHosts[env.Host] = true
+		hosts[env.Host] = true
+	}
 
+	names := map[string]string{} // spawned-route name -> definition site
+	for i := range m.Environments {
+		env := &m.Environments[i]
+		label := "environments[" + itoa(i) + "]"
 		if len(env.Routes) == 0 {
 			return fmt.Errorf("%s needs at least one route", label)
 		}
@@ -253,12 +347,16 @@ func (m *Manifest) validateEnvironments() error {
 			}
 			seenPaths[r.Path] = true
 
-			if r.Command != "" {
+			switch {
+			case r.Command != "":
 				if r.Target != "" {
 					return fmt.Errorf("%s sets both an address and command", rl)
 				}
 				if r.Port < 0 || r.Port > 65535 {
 					return fmt.Errorf("%s.command %q has invalid port (%d)", rl, r.Command, r.Port)
+				}
+				if err := checkRouteName(rl, r.Name, hosts, names); err != nil {
+					return err
 				}
 				// port 0 = roxey assigns a free one and exports PORT to the child
 				if r.Cwd != "" {
@@ -271,11 +369,33 @@ func (m *Manifest) validateEnvironments() error {
 				} else {
 					r.Cwd = m.Dir
 				}
-			} else if r.Target == "" {
+			case r.Name != "":
+				return fmt.Errorf("%s.name %q requires a command (only spawned routes take a name)", rl, r.Name)
+			case r.Target == "":
 				return fmt.Errorf("%s must map to either an address or a command", rl)
 			}
 		}
 	}
+	return nil
+}
+
+// checkRouteName validates an optional spawned-route handle: a DNS label that
+// is unique and never shadows an environment host (so {{port:name}} stays
+// unambiguous).
+func checkRouteName(loc, name string, hosts map[string]bool, seen map[string]string) error {
+	if name == "" {
+		return nil
+	}
+	if !hostRe.MatchString(name) {
+		return fmt.Errorf("%s.name %q must be a DNS label (letters, digits, dashes)", loc, name)
+	}
+	if hosts[name] {
+		return fmt.Errorf("%s.name %q collides with an environment host", loc, name)
+	}
+	if prev, ok := seen[name]; ok {
+		return fmt.Errorf("%s.name %q is already used by %s", loc, name, prev)
+	}
+	seen[name] = loc
 	return nil
 }
 
