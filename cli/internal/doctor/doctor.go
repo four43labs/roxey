@@ -8,6 +8,7 @@ import (
 	"bufio"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -187,7 +188,7 @@ func CheckLocalRelay(r *Report, tld string) {
 
 // CheckHostsBlock validates the managed /etc/hosts block against known TLDs.
 func CheckHostsBlock(r *Report, tld string) {
-	block, err := managedHostsEntries()
+	hosts, maxAliases, err := managedHosts()
 	if err != nil {
 		r.Warnf("could not read /etc/hosts: %v", err)
 		return
@@ -195,20 +196,17 @@ func CheckHostsBlock(r *Report, tld string) {
 	want := localrelay.HostsEntries(tld, nil)
 	missing := 0
 	for _, entry := range want {
-		found := false
-		for _, line := range block {
-			if strings.Contains(line, entry) {
-				found = true
-				break
-			}
-		}
-		if !found {
+		if !hosts[strings.ToLower(entry)] {
 			missing++
 			r.Failf("re-run `roxey up` to sync /etc/hosts", "hosts entry missing: %s", entry)
 		}
 	}
 	if missing == 0 {
 		r.OKf("/etc/hosts managed block present for %s", tld)
+	}
+	if maxAliases > hostsPerLineWarn {
+		r.Warnf("managed /etc/hosts block packs %d hosts on one line; macOS can ignore some of them", maxAliases)
+		r.Results[len(r.Results)-1].Fix = "re-run `roxey up` to rewrite the block one host per line"
 	}
 }
 
@@ -371,15 +369,27 @@ func fileExecutable(p string) bool {
 	return err == nil && st.Mode().IsRegular() && st.Mode()&0111 != 0
 }
 
-func managedHostsEntries() ([]string, error) {
+// hostsPerLineWarn is the point at which a managed hosts line is long
+// enough that macOS may silently ignore some of its aliases.
+const hostsPerLineWarn = 32
+
+func managedHosts() (map[string]bool, int, error) {
 	f, err := os.Open("/etc/hosts")
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer f.Close()
-	var out []string
+	return parseManagedHosts(f)
+}
+
+// parseManagedHosts tokenizes the managed block into hostnames and reports
+// the largest number of aliases on one line. Tokenizing avoids the old
+// substring bug where "pixinoid.dev" matched "api.pixinoid.dev".
+func parseManagedHosts(r io.Reader) (map[string]bool, int, error) {
+	hosts := map[string]bool{}
+	maxAliases := 0
 	inBlock := false
-	sc := bufio.NewScanner(f)
+	sc := bufio.NewScanner(r)
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		switch line {
@@ -390,11 +400,22 @@ func managedHostsEntries() ([]string, error) {
 			inBlock = false
 			continue
 		}
-		if inBlock && line != "" {
-			out = append(out, line)
+		if !inBlock || line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		aliases := fields[1:]
+		if len(aliases) > maxAliases {
+			maxAliases = len(aliases)
+		}
+		for _, h := range aliases {
+			hosts[strings.ToLower(h)] = true
 		}
 	}
-	return out, sc.Err()
+	return hosts, maxAliases, sc.Err()
 }
 
 func normalizeTarget(t string) string {
