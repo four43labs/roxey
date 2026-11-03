@@ -149,8 +149,9 @@ a clean slate — a crashed run can never leave orphans behind.
 `--online` overrides the manifest relay for that run with the hosted relay
 (`ROXEY_DOMAIN`, default `f43.run`) without creating or changing a manifest.
 If a local manifest uses dotted hosts such as `app.verifycate`, Roxey
-automatically applies a stable checkout preview slug so the hosted service
-names remain valid single DNS labels. `--protect <secret>` (or
+automatically applies a stable checkout preview slug and flattens the host
+(`<slug>-app-verifycate`) so the hosted service names remain valid single DNS
+labels. `--protect <secret>` (or
 `--protect=<secret>`) overrides protection on every environment; all hosts in
 that `up` share one unlock gate. Ad-hoc `roxey start --protect` remains scoped
 to that one host.
@@ -192,6 +193,8 @@ environments:
 
 → `https://app.netflix.dev` and `https://api.netflix.dev` run against the same `roxey.dev` as any other project you `up` (each claims its own namespace, like `*.stripe` or `*.linear`). Certificates and `/etc/hosts` entries are cumulative across projects; `down` removes only that project's names.
 
+Previews follow the same rule: a worktree under `netflix` serves `app-fix-13.netflix.dev` and `api-fix-13.netflix.dev`, so sibling services stay under `netflix.dev` and share cookies exactly as they do on main.
+
 Any explicit `tld:` is still honored (`tld: localhost` for native-resolving names, or a production-shaped domain like `dev.mycompany.dev`).
 
 #### When to use which
@@ -202,7 +205,7 @@ Any explicit `tld:` is still honored (`tld: localhost` for native-resolving name
 #### Tips for local dev
 
 - OAuth callbacks work as-is under a custom TLD: register the callback URL once and it works across every branch.
-- Give each service its own host (`api.*`, `admin.*`) rather than path prefixes when apps hard-code origins or cookies.
+- Give each service its own host (`api.*`, `admin.*`) rather than path prefixes when apps hard-code origins or cookies. Previews keep those hosts under the same parent domain, so a cookie scoped to `.` + the project domain keeps working across services.
 - The relay keeps running after `roxey down` so subsequent `up`s are instant; stop it manually with `pkill roxey-relay` — or install the boot helper (`roxey setup`) so it survives reboots and never prompts for sudo again.
 
 ### Boot-time service (Docker Desktop-style)
@@ -288,7 +291,8 @@ roxey auth [--tld <tld>] [api-key]
 roxey up [-d] [--preview[=slug]] [--online] [--protect <secret>] [--project <name>] [file]
   # Bring up every environment in a roxey.yaml manifest
   #   -d, --detach     Run detached; print URL table instead of streaming logs
-  #   --preview[=slug] Force fork-preview mode (auto-detected in git worktrees)
+  #   --preview[=slug] Force fork-preview mode (auto-detected in git worktrees);
+  #                    local hosts become app-<slug>.<project>.<tld>
   #   --online         Use ROXEY_DOMAIN or f43.run instead of the manifest relay
   #   --protect secret Protect every environment with one shared unlock gate
   #   --project <name> Run a registered project from any directory
@@ -375,7 +379,7 @@ tunnels behind its own authentication.
 | Package | What it gives you |
 |---|---|
 | `github.com/four43labs/roxey/cli/manifest` | Load and validate `roxey.yaml`; resolve `{{host:…}}`, `{{port:…}}`, `{{online}}`. `LoadWith(path, LoadOptions{RelayOptional: true})` accepts a manifest without `relay_server` when you bring your own relay. |
-| `github.com/four43labs/roxey/cli/preview` | Worktree detection, DNS-safe slugs, and port assignment (`AssignPorts`) for run-routes and their proxy aliases. |
+| `github.com/four43labs/roxey/cli/preview` | Worktree detection, DNS-safe slugs, preview host rewriting (`Apply`/`ApplyMode` with `ModeSubdomain` or `ModeFlatten`), and port assignment (`AssignPorts`) for run-routes and their proxy aliases. |
 | `github.com/four43labs/roxey/cli/runner` | Spawn run-route services (detached or foreground) with `PORT`/`HOST` and route environment, wait for readiness, tear down process groups. |
 | `github.com/four43labs/roxey/cli/tunnel` | The local side of a tunnel: `Dial` one route to a relay, or `Hold` it with automatic reconnects. Speaks the relay protocol (`/_ws`, `host:<label>` greeting, yamux over websocket frames). |
 | `github.com/four43labs/roxey/backend/relay` | The relay's routing table: register tunnels (as `Pending` until the local side has its host), resolve host/path to a tunnel, open raw streams. Bring your own HTTP server, authentication, and gating. |
