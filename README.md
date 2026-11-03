@@ -174,8 +174,10 @@ the CLI over `~/.roxey/helper.sock`. Every subsequent `up`, `down`, worktree
 preview, and agent run needs **no sudo at all**. Host-file synchronization is
 idempotent and selective: only the hostnames roxey is actually serving are
 mapped to loopback, so public sites under the same TLD (e.g. real `.dev`
-domains) keep resolving normally. You then browse your project's URLs with no
-cert warnings and no manual setup.
+domains) keep resolving normally. Each host gets its own line in the managed
+block: macOS has been observed to silently ignore some aliases when a single
+line carries a large number of names. You then browse your project's URLs with
+no cert warnings and no manual setup.
 
 Prefer to install it up front? Run `roxey setup` once. It also runs
 automatically on the first local `up` when run from a terminal; non-interactive

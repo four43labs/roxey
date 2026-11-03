@@ -38,11 +38,35 @@ func HostsEntries(tld string, envHosts []string) []string {
 // RenderBlock returns the managed /etc/hosts block for entries, or "" when
 // there is nothing to claim. It is pure so the privileged helper daemon can
 // rebuild the block server-side from validated entries.
+//
+// Every host gets its own line. macOS has been observed to silently ignore
+// some aliases when a single hosts line carries 100+ names (the resolver
+// falls back to public DNS for those), so keep lines short and unambiguous.
 func RenderBlock(entries []string) string {
 	if len(entries) == 0 {
 		return ""
 	}
-	return hostsBegin + "\n127.0.0.1 " + strings.Join(entries, " ") + "\n" + hostsEnd + "\n"
+	var b strings.Builder
+	b.WriteString(hostsBegin)
+	b.WriteByte('\n')
+	seen := make(map[string]bool, len(entries))
+	wrote := false
+	for _, entry := range entries {
+		if entry == "" || seen[entry] {
+			continue
+		}
+		seen[entry] = true
+		b.WriteString("127.0.0.1 ")
+		b.WriteString(entry)
+		b.WriteByte('\n')
+		wrote = true
+	}
+	if !wrote {
+		return ""
+	}
+	b.WriteString(hostsEnd)
+	b.WriteByte('\n')
+	return b.String()
 }
 
 // SyncHosts replaces the managed roxey block in /etc/hosts with entries
