@@ -503,14 +503,6 @@ func cmdUp(args []string) error {
 		previewSlug = preview.Slugify(b)
 	}
 	if !cpMode {
-		if opts.online && !isPreview && hasDottedHosts(m) {
-			isPreview = true
-			previewSlug = preview.PathSlug(projectName, m.Dir)
-			branch = previewSlug
-		}
-		if isPreview {
-			projectName = preview.Apply(m, projectName, previewSlug)
-		}
 		if opts.online {
 			oldTLD, wasLocal := m.RelayServer.TLD, m.RelayServer.Local
 			m.RelayServer.Local = false
@@ -518,6 +510,14 @@ func cmdUp(args []string) error {
 			if wasLocal || oldTLD != m.RelayServer.TLD {
 				m.RelayServer.APIKey = ""
 			}
+		}
+		if opts.online && !isPreview && hasDottedHosts(m) {
+			isPreview = true
+			previewSlug = preview.PathSlug(projectName, m.Dir)
+			branch = previewSlug
+		}
+		if isPreview {
+			projectName = preview.ApplyMode(m, projectName, previewSlug, previewMode(m))
 		}
 	} else {
 		// The control plane owns the public domain and authentication; ignore
@@ -1809,6 +1809,18 @@ func svcKey(manifestPath, name string) string {
 
 func sanitizeName(n string) string {
 	return strings.NewReplacer("/", "_", ":", "_").Replace(n)
+}
+
+// previewMode picks how preview hosts are rewritten for a manifest's relay.
+// The local relay accepts dotted service names, so previews keep the
+// project's parent domain and sibling services stay same-site (shared
+// cookies, SameSite=Lax). Hosted relays only accept single-label service
+// names, so previews there flatten.
+func previewMode(m *manifest.Manifest) preview.Mode {
+	if m.RelayServer.Local {
+		return preview.ModeSubdomain
+	}
+	return preview.ModeFlatten
 }
 
 func hasDottedHosts(m *manifest.Manifest) bool {

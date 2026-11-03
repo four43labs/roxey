@@ -243,16 +243,18 @@ Status is always derived live — the registry stores only identity (name, path,
 
 ### Fork previews for git worktrees (AI-agent friendly)
 
-Run `roxey up` inside a linked git worktree and roxey automatically creates an *isolated preview*: environment hosts get the branch slug as prefix, every spawned route gets a distinct fresh port, localhost proxy aliases are remapped with it, and everything registers as its own project. Detached worktrees include a stable path discriminator, so two worktrees at the same commit still get different preview names.
+Run `roxey up` inside a linked git worktree and roxey automatically creates an *isolated preview*: environment hosts get the branch slug added to their service label, every spawned route gets a distinct fresh port, localhost proxy aliases are remapped with it, and everything registers as its own project. Detached worktrees include a stable path discriminator, so two worktrees at the same commit still get different preview names.
 
 ```bash
 cd ~/projects/netflix.worktrees/fix-13-auth   # a git worktree
-roxey up                                          # → https://fix-13-app-netflix.dev
-                                                  # → https://fix-13-api-netflix.dev
+roxey up                                          # → https://app-fix-13.netflix.dev
+                                                  # → https://api-fix-13.netflix.dev
 
 roxey projects                                    # main + preview listed side by side
 roxey down                                        # tears down only this fork
 ```
+
+Preview hosts stay under the project's parent domain instead of flattening into one label, so `app-fix-13.netflix.dev` and `api-fix-13.netflix.dev` are still same-site. Cookies scoped to `.netflix.dev`, `SameSite=Lax`, CSRF protections, and cookie-authenticated WebSocket upgrades behave exactly as they do on the main checkout. A wildcard certificate for `*.netflix.dev` still covers every preview host. Hosted relays, which only accept single-label service names, keep the flattened `<slug>-app-netflix` form.
 
 You can also force a named preview from anywhere (e.g. by commit id): `roxey up --preview=abc1234`.
 
@@ -263,7 +265,7 @@ environment:
   NEXT_PUBLIC_API_URL: https://{{host:api.netflix}}/api/v1
   API_PORT: "{{port:api.netflix}}"
   ONLINE: "{{online}}"
-  # → resolves to https://fix-13-api-netflix.dev/api/v1 in the fork,
+  # → resolves to https://api-fix-13.netflix.dev/api/v1 in the fork,
   #   https://api.netflix.dev on the main checkout — same yaml file everywhere
 ```
 
