@@ -3,6 +3,9 @@ package main
 import (
 	"strings"
 	"testing"
+
+	"github.com/four43labs/roxey/cli/manifest"
+	"github.com/four43labs/roxey/cli/preview"
 )
 
 func TestParseUpOptionsOnlineProtectAndPreview(t *testing.T) {
@@ -25,6 +28,17 @@ func TestParseUpOptionsRejectsMissingProtectSecret(t *testing.T) {
 		if _, err := parseUpOptions(args); err == nil || !strings.Contains(err.Error(), "secret") {
 			t.Fatalf("parseUpOptions(%v) error = %v", args, err)
 		}
+	}
+}
+
+func TestPreviewModeFollowsRelayShape(t *testing.T) {
+	local := &manifest.Manifest{RelayServer: manifest.RelayServer{Local: true}}
+	if got := previewMode(local); got != preview.ModeSubdomain {
+		t.Fatalf("local relay preview mode = %v, want ModeSubdomain", got)
+	}
+	hosted := &manifest.Manifest{RelayServer: manifest.RelayServer{TLD: "f43.run"}}
+	if got := previewMode(hosted); got != preview.ModeFlatten {
+		t.Fatalf("hosted relay preview mode = %v, want ModeFlatten", got)
 	}
 }
 

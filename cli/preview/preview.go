@@ -1,11 +1,18 @@
 // Package preview derives fork-preview identities: when `roxey up` runs
 // inside a linked git worktree (or with --preview), environment hosts are
-// flattened into unique single-label names like
+// rewritten so each fork gets its own URLs without touching the main
+// checkout's routes.
 //
-//	issue-012-auth-fix-api-verifycate   (+ "." + tld)
+// Preview hosts keep the project's parent domain and add the slug to the
+// leftmost label:
 //
-// so each fork gets its own URLs under the shared relay without touching
-// the main checkout's routes.
+//	app.acme  ->  app-issue-012-auth-fix.acme  (+ "." + tld)
+//	api.acme  ->  api-issue-012-auth-fix.acme
+//
+// Both stay under the same registrable domain (acme.<tld>), so cookies and
+// SameSite=Lax behave exactly as they do on the main checkout. Relays that
+// only accept single-label services (the hosted relay) use ModeFlatten,
+// which collapses the host into one label instead.
 package preview
 
 import (
@@ -46,8 +53,8 @@ func Detect(dir string) (branch string, ok bool) {
 }
 
 // PathSlug returns a stable preview identity for a project checkout. It is
-// used when hosted mode needs dotted service names flattened outside a linked
-// worktree.
+// used when no branch is available, such as --online auto-previews, so two
+// checkouts never claim the same hosts.
 func PathSlug(projectName, dir string) string {
 	return Slugify(projectName + "-" + shortHash(cleanPath(dir)))
 }
@@ -98,11 +105,44 @@ func Slugify(s string) string {
 	return out
 }
 
-// Apply rewrites m in place into its preview variant: every environment host
-// becomes "<slug>-<host with dots as dashes>" (single DNS label), templates
-// keep resolving against original names, and the registry name becomes
-// "<projectName>--<slug>". Returns the new project name.
+// Mode selects how Apply derives preview hostnames.
+type Mode int
+
+const (
+	// ModeSubdomain keeps every host under its existing parent domain by
+	// appending the slug to the leftmost label:
+	//
+	//	app.acme  ->  app-<slug>.acme
+	//
+	// The result is one extra label, so a "*.acme.<tld>" certificate still
+	// covers it, and sibling services stay same-site (shared cookies,
+	// SameSite=Lax). Use this for relays that accept dotted service names,
+	// including the local relay.
+	ModeSubdomain Mode = iota
+
+	// ModeFlatten collapses the whole host into a single label:
+	//
+	//	app.acme  ->  <slug>-app-acme
+	//
+	// Hosted relays only accept single-label service names (they append their
+	// own account suffix and serve a one-level wildcard), so previews there
+	// must flatten.
+	ModeFlatten
+)
+
+// Apply rewrites m in place into its preview variant using ModeSubdomain.
+// It is the right default for local development; callers targeting a relay
+// that only accepts single-label services should use ApplyMode with
+// ModeFlatten.
 func Apply(m *manifest.Manifest, projectName, slug string) string {
+	return ApplyMode(m, projectName, slug, ModeSubdomain)
+}
+
+// ApplyMode rewrites m in place into its preview variant. Environment hosts
+// and the {{host:X}} map are rewritten according to mode; templates keep
+// resolving against the original names, and the registry name becomes
+// "<projectName>--<slug>". Returns the new project name.
+func ApplyMode(m *manifest.Manifest, projectName, slug string, mode Mode) string {
 	// Original declared hosts (keys), so {{host:X}} keeps working.
 	origins := make([]string, 0, len(m.HostMap))
 	for orig := range m.HostMap {
@@ -110,15 +150,28 @@ func Apply(m *manifest.Manifest, projectName, slug string) string {
 	}
 
 	for i := range m.Environments {
-		e := &m.Environments[i]
-		e.Host = slug + "-" + strings.ReplaceAll(e.Host, ".", "-")
+		m.Environments[i].Host = previewHost(m.Environments[i].Host, slug, mode)
 	}
-
 	for _, orig := range origins {
-		m.HostMap[orig] = slug + "-" + strings.ReplaceAll(orig, ".", "-")
+		m.HostMap[orig] = previewHost(orig, slug, mode)
 	}
 
 	return projectName + "--" + slug
+}
+
+// previewHost derives one preview hostname. Both modes preserve the
+// declared host's suffix and stay unique per slug; they differ only in
+// whether the slug joins the leftmost label or replaces the label structure.
+func previewHost(host, slug string, mode Mode) string {
+	if mode == ModeFlatten {
+		return slug + "-" + strings.ReplaceAll(host, ".", "-")
+	}
+	label, rest, dotted := strings.Cut(host, ".")
+	label = strings.TrimSuffix(label, "-") + "-" + slug
+	if dotted {
+		return label + "." + rest
+	}
+	return label
 }
 
 // AssignPorts gives every auto-port route a distinct free port. In preview

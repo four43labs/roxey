@@ -142,6 +142,39 @@ check "B survives A's down" "curl -sf -H 'Host: app.projb.smoke.localhost' http:
 sleep 0.5
 check "registry emptied by downs" "! \"$CLI\" projects | grep -qE '^proj'"
 
+echo "== preview hosts =="
+# A remote-style manifest targets the hosted shape, where service names must
+# be one DNS label, so its preview stays flattened.
+mkdir -p "$WORK/projP"
+cat > "$WORK/projP/roxey.yaml" <<EOF
+relay_server: {tld: smoke.localhost}
+environments:
+  - host: app.projp
+    routes:
+      "/": localhost:19999
+  - host: api.projp
+    routes:
+      "/": localhost:19999
+EOF
+"$CLI" up -d --preview=fix-13 "$WORK/projP/roxey.yaml" >/dev/null
+sleep 1
+check "remote preview app flattened" \
+  "curl -sf -H 'Host: fix-13-app-projp.smoke.localhost' http://127.0.0.1:18080/ | grep -q 'Directory listing'"
+check "remote preview api flattened" \
+  "curl -sf -H 'Host: fix-13-api-projp.smoke.localhost' http://127.0.0.1:18080/ | grep -q 'Directory listing'"
+"$CLI" down "$WORK/projP/roxey.yaml" >/dev/null
+sleep 0.5
+# The local relay accepts dotted service names; up uses this form for local
+# previews so sibling services stay same-site. Prove the relay routes it.
+"$CLI" start app-fix-13.projp localhost:19999 >/dev/null
+sleep 0.7
+check "local relay routes dotted preview host" \
+  "curl -sf -H 'Host: app-fix-13.projp.smoke.localhost' http://127.0.0.1:18080/ | grep -q 'Directory listing'"
+"$CLI" stop app-fix-13.projp >/dev/null
+sleep 0.5
+check "dotted preview host torn down" \
+  "! curl -sf -H 'Host: app-fix-13.projp.smoke.localhost' http://127.0.0.1:18080/ >/dev/null"
+
 echo "== multi-user relay: signup, namespacing, protection =="
 MU=18082
 ROXEY_DOMAIN=mu.localhost ROXEY_ADMIN_HOST=roxey.mu.localhost PORT=$MU \

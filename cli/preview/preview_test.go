@@ -56,17 +56,17 @@ func TestSlugify(t *testing.T) {
 	}
 }
 
-func TestApplyFlattensHostsAndKeepsTemplates(t *testing.T) {
+func TestApplySubdomainKeepsServicesSameSite(t *testing.T) {
 	m, _ := loadManifest(t, yamlBase)
 
-	name := Apply(m, "verifycate", "fix-13")
+	name := ApplyMode(m, "verifycate", "fix-13", ModeSubdomain)
 	if name != "verifycate--fix-13" {
 		t.Fatalf("registry name = %q", name)
 	}
 	app := m.Environments[0].Host
 	api := m.Environments[1].Host
-	if app != "fix-13-app-verifycate" || api != "fix-13-api-verifycate" {
-		t.Fatalf("hosts not flattened: %q %q", app, api)
+	if app != "app-fix-13.verifycate" || api != "api-fix-13.verifycate" {
+		t.Fatalf("hosts not namespaced under the project domain: %q %q", app, api)
 	}
 
 	if err := m.ResolveEnvTemplates(false); err != nil {
@@ -85,6 +85,41 @@ func TestApplyFlattensHostsAndKeepsTemplates(t *testing.T) {
 	}
 	if got := m2.Environments[0].Routes[0].Environment["NEXT_PUBLIC_API_URL"]; got != "https://api.verifycate.dev/api/v1" {
 		t.Fatalf("main template = %q", got)
+	}
+}
+
+func TestApplyDefaultsToSubdomain(t *testing.T) {
+	m, _ := loadManifest(t, yamlBase)
+
+	Apply(m, "verifycate", "fix-13")
+	if got := m.Environments[0].Host; got != "app-fix-13.verifycate" {
+		t.Fatalf("Apply host = %q, want subdomain form", got)
+	}
+}
+
+func TestApplyFlattenIsForHostedRelays(t *testing.T) {
+	m, _ := loadManifest(t, yamlBase)
+
+	ApplyMode(m, "verifycate", "fix-13", ModeFlatten)
+	app := m.Environments[0].Host
+	api := m.Environments[1].Host
+	if app != "fix-13-app-verifycate" || api != "fix-13-api-verifycate" {
+		t.Fatalf("hosts not flattened: %q %q", app, api)
+	}
+}
+
+func TestPreviewHostKeepsParentDomain(t *testing.T) {
+	cases := []struct {
+		host, slug, want string
+	}{
+		{"app.acme", "fix-13", "app-fix-13.acme"},
+		{"api.eu.acme", "fix-13", "api-fix-13.eu.acme"},
+		{"app", "fix-13", "app-fix-13"},
+	}
+	for _, c := range cases {
+		if got := previewHost(c.host, c.slug, ModeSubdomain); got != c.want {
+			t.Errorf("previewHost(%q, %q) = %q, want %q", c.host, c.slug, got, c.want)
+		}
 	}
 }
 
